@@ -5,13 +5,14 @@ from qgis.PyQt.QtWidgets import (
     QPushButton, QTextBrowser, QVBoxLayout,
 )
 
+TOKEN_URL = "https://dadata.ru/profile/#info"
 STATUS_COLOURS = {"ok": "#2e7d32", "warning": "#e65100", "error": "#b71c1c"}
 
 
 class GeoSearchDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("GeoSearch RU — поиск адреса")
+        self.setWindowTitle("Поиск адреса")
         self.setMinimumWidth(560)
         self.token_edit = QLineEdit()
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -26,13 +27,21 @@ class GeoSearchDialog(QDialog):
         self.results_list = QListWidget()
         self.results_list.setMinimumHeight(110)
         self.normalized_address = QTextBrowser()
-        self.normalized_address.setMinimumHeight(115)
+        self.normalized_address.setMinimumHeight(140)
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
+        # Room for two lines: a wrapped status does not grow the dialog and would overlap the text above.
+        self.status_label.setMinimumHeight(self.status_label.fontMetrics().lineSpacing() * 2 + 4)
         self.clear_button = QPushButton("Очистить маркер")
         self.clear_button.setAutoDefault(False)
+        self.add_point_button = QPushButton("Добавить точку во временный слой")
+        self.add_point_button.setAutoDefault(False)
+        self.add_point_button.setToolTip("Добавить выбранный адрес точкой во временный слой «Найденные адреса»")
+        token_label = QLabel(f'<a href="{TOKEN_URL}">Токен DaData</a>:')
+        token_label.setOpenExternalLinks(True)
+        token_label.setToolTip("Открыть личный кабинет DaData: после регистрации там будет API-ключ")
         form = QFormLayout()
-        form.addRow("Токен DaData:", self.token_edit)
+        form.addRow(token_label, self.token_edit)
         form.addRow("", self.remember_token)
         form.addRow("Адрес:", self.address_edit)
         search_row = QHBoxLayout()
@@ -40,6 +49,7 @@ class GeoSearchDialog(QDialog):
         search_row.addWidget(self.search_button)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.addButton(self.clear_button, QDialogButtonBox.ButtonRole.ResetRole)
+        buttons.addButton(self.add_point_button, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
@@ -64,6 +74,7 @@ class GeoSearchDialog(QDialog):
 
     def clear_results(self):
         self.results_list.clear()
+        self.add_point_button.setEnabled(False)
         self.results_label.setText("Варианты:")
         self.normalized_address.clear()
 

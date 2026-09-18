@@ -2,14 +2,15 @@ import json
 import os
 
 from qgis.core import (
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsNetworkAccessManager,
-    QgsPointXY, QgsProject,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsFeature, QgsGeometry,
+    QgsMarkerSymbol, QgsNetworkAccessManager, QgsPointXY, QgsProject, QgsVectorLayer,
 )
 from qgis.gui import QgsVertexMarker
 from qgis.PyQt.QtCore import QSettings, QUrl
 from qgis.PyQt.QtGui import QAction, QColor, QIcon
 from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 
+from . import altan_toolbar
 from .geosearch_ru_dialog import GeoSearchDialog
 
 # DaData qc_geo: how precisely the coordinates match the address.
@@ -23,6 +24,15 @@ QC_GEO_LABELS = {
 QC_GEO_SCALES = {0: 2500, 1: 2500, 2: 10000, 3: 50000, 4: 100000}
 COARSE_QC_GEO = 3
 DEFAULT_SCALE = 50000
+
+POINTS_LAYER_NAME = "Найденные адреса"
+POINTS_LAYER_URI = (
+    "Point?crs=EPSG:4326&field=address:string&field=lat:double&field=lon:double"
+    "&field=precision:string&field=qc_geo:integer"
+)
+POINTS_FIELD_ALIASES = {
+    "address": "Адрес", "lat": "Широта", "lon": "Долгота", "precision": "Точность", "qc_geo": "Код точности DaData",
+}
 
 HTTP_ERROR_HINTS = {
     400: "некорректный запрос",
@@ -45,12 +55,13 @@ class GeoSearchRU:
         self.iface, self.action, self.dialog = iface, None, None
         self.marker = self.marker_wgs84 = self.reply = None
         self.suggestions = []
+        self.points_layer_id = None
 
     def initGui(self):
         icon = QIcon(os.path.join(os.path.dirname(__file__), "resources", "geosearch_ru.svg"))
-        self.action = QAction(icon, "GeoSearch RU — найти адрес", self.iface.mainWindow())
+        self.action = QAction(icon, "Поиск адреса…", self.iface.mainWindow())
         self.action.triggered.connect(self.show_dialog)
-        self.iface.addToolBarIcon(self.action)
+        altan_toolbar.add_action(self.iface, self.action)
         self.iface.addPluginToMenu(self.MENU, self.action)
         self.iface.mapCanvas().destinationCrsChanged.connect(self._reposition_marker)
 
@@ -63,7 +74,7 @@ class GeoSearchRU:
             self.dialog.deleteLater()
             self.dialog = None
         if self.action:
-            self.iface.removeToolBarIcon(self.action)
+            altan_toolbar.remove_action(self.iface, self.action)
             self.iface.removePluginMenu(self.MENU, self.action)
             self.action.deleteLater()
             self.action = None
@@ -79,6 +90,7 @@ class GeoSearchRU:
             self.dialog.search_button.clicked.connect(self.search)
             self.dialog.results_list.currentRowChanged.connect(self.show_suggestion)
             self.dialog.clear_button.clicked.connect(self.clear_result)
+            self.dialog.add_point_button.clicked.connect(self.add_point)
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
@@ -132,6 +144,7 @@ class GeoSearchRU:
             return
         suggestion = self.suggestions[row]
         address, coordinates = self._address(suggestion), self._coordinates(suggestion)
+        self.dialog.add_point_button.setEnabled(coordinates is not None)
         if coordinates is None:
             self._clear_marker()
             self.dialog.normalized_address.setPlainText(f"{address}\n\nКоординаты не определены.")
@@ -148,6 +161,43 @@ class GeoSearchRU:
             self.dialog.set_status(f"Координаты приблизительные ({precision}). Уточните адрес.", "warning")
         else:
             self.dialog.set_status("Адрес и координаты найдены.")
+
+    def add_point(self):
+        row = self.dialog.results_list.currentRow()
+        if not 0 <= row < len(self.suggestions):
+            return
+        suggestion = self.suggestions[row]
+        coordinates = self._coordinates(suggestion)
+        if coordinates is None:
+            return
+        latitude, longitude = coordinates
+        address = self._address(suggestion)
+        layer = self._points_layer()
+        for feature in layer.getFeatures():
+            if feature["address"] == address and feature["lat"] == latitude and feature["lon"] == longitude:
+                self.dialog.set_status(f"Этот адрес уже есть в слое «{layer.name()}».", "warning")
+                return
+        feature = QgsFeature(layer.fields())
+        feature.setAttributes([address, latitude, longitude, self._precision(suggestion), self._qc_geo(suggestion)])
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(longitude, latitude)))
+        layer.dataProvider().addFeatures([feature])
+        layer.updateExtents()
+        layer.triggerRepaint()
+        self.dialog.set_status(f"Точка добавлена во временный слой «{layer.name()}» (точек: {layer.featureCount()}).")
+
+    def _points_layer(self):
+        # One scratch layer for all found addresses; recreated if the user removed it.
+        layer = QgsProject.instance().mapLayer(self.points_layer_id) if self.points_layer_id else None
+        if layer is None:
+            layer = QgsVectorLayer(POINTS_LAYER_URI, POINTS_LAYER_NAME, "memory")
+            for name, alias in POINTS_FIELD_ALIASES.items():
+                layer.setFieldAlias(layer.fields().indexOf(name), alias)
+            layer.renderer().setSymbol(QgsMarkerSymbol.createSimple(
+                {"name": "circle", "color": "#d32f2f", "outline_color": "#ffffff", "size": "3"}
+            ))
+            QgsProject.instance().addMapLayer(layer)
+            self.points_layer_id = layer.id()
+        return layer
 
     def clear_result(self):
         self._clear_marker()

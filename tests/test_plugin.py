@@ -13,7 +13,7 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from qgis.PyQt.QtCore import QCoreApplication, QSettings  # noqa: E402
+from qgis.PyQt.QtCore import QEvent, QCoreApplication, QSettings  # noqa: E402
 
 PROFILE = os.path.join(HERE, "_profile")
 shutil.rmtree(PROFILE, ignore_errors=True)
@@ -22,10 +22,10 @@ QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, PROFILE
 QCoreApplication.setOrganizationName("geosearch-ru-tests")
 QCoreApplication.setApplicationName("geosearch-ru-tests")
 
-from qgis.core import QgsApplication, QgsCoordinateReferenceSystem  # noqa: E402
+from qgis.core import QgsApplication, QgsCoordinateReferenceSystem, QgsProject  # noqa: E402
 from qgis.gui import QgsMapCanvas  # noqa: E402
 from qgis.PyQt.QtNetwork import QNetworkReply  # noqa: E402
-from qgis.PyQt.QtWidgets import QMainWindow  # noqa: E402
+from qgis.PyQt.QtWidgets import QLabel, QMainWindow, QToolBar  # noqa: E402
 
 APP = QgsApplication([], True)
 APP.initQgis()
@@ -92,11 +92,8 @@ class Iface:
     def mapCanvas(self):
         return self.canvas
 
-    def addToolBarIcon(self, action):
-        pass
-
-    def removeToolBarIcon(self, action):
-        pass
+    def addToolBar(self, name):
+        return self.window.addToolBar(name)
 
     def addPluginToMenu(self, menu, action):
         self.menu.append(menu)
@@ -120,6 +117,12 @@ def respond(reply):
 
 def test_menu():
     assert iface.menu == ["&Альтан-Эко"], iface.menu
+
+
+def test_shared_toolbar():
+    bar = iface.window.findChild(QToolBar, "AltanEcoToolbar")
+    assert bar is not None and bar.windowTitle() == "Альтан-Эко"
+    assert plugin.action in bar.actions()
 
 
 def test_suggestions_list_and_marker():
@@ -154,6 +157,42 @@ def test_marker_follows_crs_change():
     center = plugin.marker.center()
     assert abs(center.x() - 41.45) < 1e-6 and abs(center.y() - 52.72) < 1e-6, center.toString()
     iface.canvas.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
+
+
+def test_token_label_links_to_dadata():
+    links = [label for label in dialog.findChildren(QLabel) if "dadata.ru/profile" in label.text()]
+    assert len(links) == 1 and links[0].openExternalLinks(), [label.text() for label in dialog.findChildren(QLabel)]
+
+
+def test_add_point_to_scratch_layer():
+    dialog.results_list.setCurrentRow(2)
+    assert not dialog.add_point_button.isEnabled(), "без координат добавлять нечего"
+    dialog.results_list.setCurrentRow(0)
+    assert dialog.add_point_button.isEnabled()
+    dialog.add_point_button.click()
+    layers = QgsProject.instance().mapLayersByName("Найденные адреса")
+    assert len(layers) == 1 and layers[0].providerType() == "memory", layers
+    layer = layers[0]
+    assert layer.crs().authid() == "EPSG:4326" and layer.featureCount() == 1
+    feature = next(layer.getFeatures())
+    assert feature["address"] == "392000, Тамбовская обл, г Тамбов, пр-кт Энергетиков, д 7", feature.attributes()
+    assert feature["precision"] == "точные координаты дома" and feature["qc_geo"] == 0, feature.attributes()
+    point = feature.geometry().asPoint()
+    assert abs(point.x() - 41.45) < 1e-9 and abs(point.y() - 52.72) < 1e-9, point.toString()
+    assert layer.attributeDisplayName(layer.fields().indexOf("lat")) == "Широта"
+
+    dialog.add_point_button.click()
+    assert layer.featureCount() == 1 and "уже есть" in dialog.status_label.text(), dialog.status_label.text()
+
+    dialog.results_list.setCurrentRow(1)
+    dialog.add_point_button.click()
+    assert layer.featureCount() == 2 and "точек: 2" in dialog.status_label.text(), dialog.status_label.text()
+
+    QgsProject.instance().removeMapLayer(layer.id())
+    dialog.results_list.setCurrentRow(0)
+    dialog.add_point_button.click()
+    layers = QgsProject.instance().mapLayersByName("Найденные адреса")
+    assert len(layers) == 1 and layers[0].featureCount() == 1, "удалённый слой создаётся заново"
 
 
 def test_clear_result():
@@ -194,6 +233,9 @@ def test_unload_aborts_request_silently():
     plugin.unload()
     assert reply.aborted and reply.finished.slots == []
     assert plugin.dialog is None and plugin.action is None and iface.menu == []
+    APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    bar = iface.window.findChild(QToolBar, "AltanEcoToolbar")
+    assert bar is None, "пустая общая панель должна удаляться"
 
 
 TESTS = [value for name, value in list(globals().items()) if name.startswith("test_")]

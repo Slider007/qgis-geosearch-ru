@@ -1,4 +1,4 @@
-"""QGIS plugin entry point for GeoSearch RU."""
+"""QGIS plugin entry point for the «Поиск адреса» plugin (GeoSearchRU)."""
 
 
 def classFactory(iface):
