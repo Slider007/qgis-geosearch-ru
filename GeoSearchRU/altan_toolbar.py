@@ -7,6 +7,7 @@
 objectName. Показать/скрыть — «Вид → Панели инструментов → Альтан-Эко».
 """
 
+from qgis.PyQt import sip
 from qgis.PyQt.QtWidgets import QToolBar
 
 TOOLBAR_NAME = "Альтан-Эко"
@@ -22,6 +23,10 @@ def add_action(iface, action):
     bar = _find(iface)
     if bar is None:
         bar = iface.addToolBar(TOOLBAR_NAME)
+        # iface.addToolBar отдаёт панель во владение Python: без передачи её Qt
+        # панель удалится, как только исчезнет последняя ссылка из Python.
+        # Она общая для всех модулей, поэтому держать её должно главное окно.
+        sip.transferto(bar, iface.mainWindow())
         bar.setObjectName(TOOLBAR_ID)
         bar.setToolTip("Модули Альтан-Эко")
         bar.setMovable(True)
