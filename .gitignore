@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+/dist/
+/tests/_profile/
+/tests/_out.log
+CLAUDE.local.md

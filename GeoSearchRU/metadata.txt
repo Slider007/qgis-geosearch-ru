@@ -1,0 +1,22 @@
+[general]
+name=GeoSearch RU — поиск адреса
+qgisMinimumVersion=3.40
+qgisMaximumVersion=4.99
+supportsQt6=True
+description=Поиск российских адресов через подсказки DaData: нормализованный адрес, координаты WGS 84 с точностью и маркер на карте
+about=Ищет адрес по России через API подсказок DaData и показывает до 10 вариантов. Для выбранного варианта — нормализованный адрес с индексом, широта и долгота в WGS 84 и точность координат (дом, улица, населённый пункт, город). Карта переходит к адресу в масштабе по точности, на месте ставится временный маркер; при приблизительных координатах выводится предупреждение. Нужен бесплатный API-токен DaData. Запросы идут через сетевые настройки QGIS, в том числе прокси.
+version=0.2.0
+author=Slider007
+email=16690768+Slider007@users.noreply.github.com
+homepage=https://github.com/Slider007/qgis-geosearch-ru
+repository=https://github.com/Slider007/qgis-geosearch-ru
+tracker=https://github.com/Slider007/qgis-geosearch-ru/issues
+tags=geocoding,geocoder,address,search,dadata,russia,геокодирование,геокодер,адрес,адреса,поиск адреса,найти адрес,координаты,дадата,ФИАС,КЛАДР,Россия
+category=Web
+icon=resources/geosearch_ru.svg
+experimental=False
+deprecated=False
+hasProcessingProvider=no
+changelog=
+    0.2.0 - до 10 вариантов адреса списком; точность координат (qc_geo) и предупреждение о приблизительных координатах, масштаб карты по точности; кнопка «Очистить маркер», маркер остаётся на месте при смене СК проекта; запросы через сетевые настройки QGIS (прокси) с таймаутом 15 с; понятные сообщения об ошибках DaData (неверный токен, лимит); токен можно не запоминать; пункт меню — в общем подменю «Модули → Альтан-Эко»; корректная выгрузка модуля; поддержка QGIS 4.
+    0.1.1 - первая версия.
