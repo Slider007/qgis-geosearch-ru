@@ -46,7 +46,7 @@ def _json_message(body):
 
 class Dadata:
     ID = "dadata"
-    TITLE = "DaData (нужен токен)"
+    TITLE = "DaData"
     SOURCE = "DaData"
     NEEDS_TOKEN = True
     NEEDS_SECRET = False
@@ -75,7 +75,7 @@ class Dadata:
         4: ("город", 100000),
     }
 
-    def request(self, query, token, count, secret=""):
+    def request(self, query, token, count, secret="", signature_mode=None):
         request = QNetworkRequest(QUrl(self.URL))
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
         request.setRawHeader(b"Accept", b"application/json")
@@ -112,7 +112,7 @@ class Nominatim:
     """
 
     ID = "nominatim"
-    TITLE = "OpenStreetMap (Nominatim), без токена"
+    TITLE = "OpenStreetMap (без ключа)"
     SOURCE = "OpenStreetMap"
     NEEDS_TOKEN = False
     NEEDS_SECRET = False
@@ -138,7 +138,7 @@ class Nominatim:
             settings.setValue(self.SETTINGS_URL, self.DEFAULT_URL)
         return settings.value(self.SETTINGS_URL, "", type=str).strip() or self.DEFAULT_URL
 
-    def request(self, query, token, count, secret=""):
+    def request(self, query, token, count, secret="", signature_mode=None):
         url = QUrl(self.url())
         params = QUrlQuery()
         for key, value in (
@@ -190,7 +190,7 @@ class Yandex:
     """
 
     ID = "yandex"
-    TITLE = "Яндекс (нужен ключ)"
+    TITLE = "Яндекс"
     SOURCE = "Яндекс"
     NEEDS_TOKEN = True
     NEEDS_SECRET = True
@@ -200,10 +200,11 @@ class Yandex:
     TOKEN_PLACEHOLDER = "API-ключ Геокодера"
     SETTINGS_TOKEN = "GeoSearchRU/yandex_key"
     SETTINGS_SECRET = "GeoSearchRU/yandex_secret"
-    SETTINGS_SIGNATURE = "GeoSearchRU/yandex_signature"  # "ttl" (default) or "plain"
+    SETTINGS_SIGNATURE = "GeoSearchRU/yandex_signature"  # "ttl" (default) or "plain"; the key check picks it
+    SIGNATURE_MODES = ("ttl", "plain")
     ATTRIBUTION = 'Данные © <a href="https://yandex.ru/legal/maps_api/">Яндекс</a>.'
     MIN_INTERVAL_MS = 0
-    URL = "https://geocode-maps.yandex.ru/v1/"
+    HOST = "https://geocode-maps.yandex.ru"
     HTTP_HINTS = {
         400: "некорректный запрос",
         403: "неверный ключ или подпись, либо ключ ещё не активирован (до 15 минут после получения)",
@@ -226,13 +227,14 @@ class Yandex:
         "country": ("страна", True, 10000000),
     }
 
-    def request(self, query, token, count, secret=""):
+    def request(self, query, token, count, secret="", signature_mode=None):
         params = [("geocode", query), ("lang", "ru_RU"), ("format", "json"), ("results", str(count)), ("apikey", token)]
         path = "/v1/?" + "&".join(f"{k}={quote(v, safe='')}" for k, v in params)
         if secret:
-            path += "&signature=" + self.signature(path, secret, QSettings().value(self.SETTINGS_SIGNATURE, "ttl", type=str))
+            mode = signature_mode or QSettings().value(self.SETTINGS_SIGNATURE, "ttl", type=str)
+            path += "&signature=" + self.signature(path, secret, mode)
         # fromEncoded keeps the query byte for byte as signed.
-        request = QNetworkRequest(QUrl.fromEncoded(("https://geocode-maps.yandex.ru" + path).encode()))
+        request = QNetworkRequest(QUrl.fromEncoded((self.HOST + path).encode()))
         request.setRawHeader(b"Accept", b"application/json")
         return request, None
 

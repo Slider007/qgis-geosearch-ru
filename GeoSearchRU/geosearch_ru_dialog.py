@@ -1,8 +1,8 @@
 import html
 
 from qgis.PyQt.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QPushButton, QTextBrowser, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QPushButton, QTextBrowser, QVBoxLayout,
 )
 
 STATUS_COLOURS = {"ok": "#2e7d32", "warning": "#e65100", "error": "#b71c1c"}
@@ -23,12 +23,9 @@ class GeoSearchDialog(QDialog):
         # Wrapped labels do not grow the dialog, so reserve their lines up front.
         line = self.attribution_label.fontMetrics().lineSpacing()
         self.attribution_label.setMinimumHeight(line * 3 + 4)
-        self.token_edit = QLineEdit()
-        self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.secret_edit = QLineEdit()
-        self.secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.secret_edit.setPlaceholderText("Секрет подписи — если в Кабинете включена подпись запросов")
-        self.remember_token = QCheckBox("Запомнить ключи на этом компьютере")
+        self.keys_button = QPushButton("Ключи…")
+        self.keys_button.setAutoDefault(False)
+        self.keys_button.setToolTip("Токен DaData и ключ Яндекса — ввести и проверить")
         self.address_edit = QLineEdit()
         self.address_edit.setPlaceholderText("Например: г. Тамбов, пр. Энергетиков, 7")
         self.address_edit.setClearButtonEnabled(True)
@@ -47,19 +44,11 @@ class GeoSearchDialog(QDialog):
         self.add_point_button = QPushButton("Добавить точку во временный слой")
         self.add_point_button.setAutoDefault(False)
         self.add_point_button.setToolTip("Добавить выбранный адрес точкой во временный слой «Найденные адреса»")
-        self.token_label = token_label = QLabel()
-        token_label.setOpenExternalLinks(True)
         form = QFormLayout()
-        form.addRow("Источник:", self.provider_combo)
-        # Key and secret share one form row: a hidden QFormLayout row still leaves a gap in Qt5.
-        keys = QWidget()
-        keys_layout = QVBoxLayout(keys)
-        keys_layout.setContentsMargins(0, 0, 0, 0)
-        keys_layout.addWidget(self.token_edit)
-        keys_layout.addWidget(self.secret_edit)
-        self.keys_widget = keys
-        form.addRow(token_label, keys)
-        form.addRow("", self.remember_token)
+        source_row = QHBoxLayout()
+        source_row.addWidget(self.provider_combo, 1)
+        source_row.addWidget(self.keys_button)
+        form.addRow("Источник:", source_row)
         form.addRow("Адрес:", self.address_edit)
         search_row = QHBoxLayout()
         search_row.addStretch()
@@ -86,15 +75,15 @@ class GeoSearchDialog(QDialog):
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
 
+    def set_provider_titles(self, titles):
+        """titles: {provider id: text shown in the source selector}."""
+        for index in range(self.provider_combo.count()):
+            title = titles.get(self.provider_combo.itemData(index))
+            if title:
+                self.provider_combo.setItemText(index, title)
+
     def show_provider(self, provider):
-        """Show the key fields, their link and the attribution the provider needs."""
-        for widget in (self.token_label, self.keys_widget, self.remember_token):
-            widget.setVisible(provider.NEEDS_TOKEN)
-        self.secret_edit.setVisible(provider.NEEDS_SECRET)
-        if provider.NEEDS_TOKEN:
-            self.token_label.setText(f'<a href="{provider.TOKEN_URL}">{provider.TOKEN_LABEL}</a>:')
-            self.token_label.setToolTip(provider.TOKEN_HINT)
-            self.token_edit.setPlaceholderText(provider.TOKEN_PLACEHOLDER)
+        """Show the attribution the provider needs."""
         self.attribution_label.setText(provider.ATTRIBUTION or "")
         self.attribution_label.setVisible(bool(provider.ATTRIBUTION))
 
@@ -114,9 +103,7 @@ class GeoSearchDialog(QDialog):
         self.normalized_address.clear()
 
     def set_busy(self, busy):
-        for widget in (self.search_button, self.address_edit, self.provider_combo):
-            widget.setEnabled(not busy)
-        for widget in (self.token_edit, self.remember_token, self.secret_edit):
+        for widget in (self.search_button, self.address_edit, self.provider_combo, self.keys_button):
             widget.setEnabled(not busy)
         self.status_label.setText("Идет поиск…" if busy else "")
 

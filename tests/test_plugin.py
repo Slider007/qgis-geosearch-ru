@@ -29,7 +29,7 @@ QCoreApplication.setApplicationName("geosearch-ru-tests")
 from qgis.core import QgsApplication, QgsCoordinateReferenceSystem, QgsProject  # noqa: E402
 from qgis.gui import QgsMapCanvas  # noqa: E402
 from qgis.PyQt.QtNetwork import QNetworkReply  # noqa: E402
-from qgis.PyQt.QtWidgets import QLabel, QMainWindow, QMenu, QToolBar  # noqa: E402
+from qgis.PyQt.QtWidgets import QDialogButtonBox, QLabel, QMainWindow, QMenu, QToolBar  # noqa: E402
 
 APP = QgsApplication([], True)
 APP.initQgis()
@@ -131,7 +131,9 @@ def test_dadata_is_default_source():
     assert dialog.provider_combo.currentData() == "dadata"
     assert [dialog.provider_combo.itemData(i) for i in range(dialog.provider_combo.count())] == [
         "dadata", "yandex", "nominatim"]
-    assert dialog.token_edit.isVisibleTo(dialog) and dialog.attribution_label.isHidden()
+    assert dialog.attribution_label.isHidden() and dialog.keys_button.isVisibleTo(dialog)
+    titles = [dialog.provider_combo.itemText(i) for i in range(dialog.provider_combo.count())]
+    assert titles == ["DaData — нет ключа", "Яндекс — нет ключа", "OpenStreetMap (без ключа)"], titles
 
 
 def test_menu():
@@ -178,9 +180,61 @@ def test_marker_follows_crs_change():
     iface.canvas.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
 
 
-def test_token_label_links_to_dadata():
-    links = [label for label in dialog.findChildren(QLabel) if "dadata.ru/profile" in label.text()]
-    assert len(links) == 1 and links[0].openExternalLinks(), [label.text() for label in dialog.findChildren(QLabel)]
+def keys_window():
+    return plugin.keys_dialog
+
+
+def save_keys():
+    keys_window().findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Save).click()
+    APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_search_without_key_opens_keys_window():
+    dialog.set_provider("yandex")
+    dialog.address_edit.setText("Тамбов")
+    dialog.search_button.click()
+    assert "нужен ключ" in dialog.status_label.text(), dialog.status_label.text()
+    assert keys_window() is not None and keys_window().isVisible()
+    keys_window().reject()
+    APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert plugin.keys_dialog is None
+    dialog.set_provider("dadata")
+
+
+def test_keys_window_links_to_where_keys_are():
+    plugin.open_keys("dadata")
+    links = [label.text() for label in keys_window().findChildren(QLabel) if "href" in label.text()]
+    assert any("dadata.ru/profile" in link for link in links), links
+    assert any("developer.tech.yandex.ru" in link for link in links), links
+    assert all(label.openExternalLinks() for label in keys_window().findChildren(QLabel) if "href" in label.text())
+    assert set(keys_window().sections) == {"dadata", "yandex"}, "OpenStreetMap ключ не нужен"
+    assert not keys_window().sections["dadata"].secret_edit.isVisibleTo(keys_window())
+    assert keys_window().sections["yandex"].secret_edit.isVisibleTo(keys_window())
+    keys_window().reject()
+    APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_keys_are_saved_from_keys_window():
+    plugin.open_keys("dadata")
+    sections = keys_window().sections
+    sections["dadata"].token_edit.setText("dadata-token")
+    sections["yandex"].token_edit.setText("yandex-key")
+    sections["yandex"].secret_edit.setText("yandex-secret")
+    keys_window().remember.setChecked(True)
+    save_keys()
+    assert plugin.keys_dialog is None
+    settings = QSettings()
+    assert settings.value("GeoSearchRU/dadata_token") == "dadata-token"
+    assert (settings.value("GeoSearchRU/yandex_key"), settings.value("GeoSearchRU/yandex_secret")) == (
+        "yandex-key", "yandex-secret")
+    titles = [dialog.provider_combo.itemText(i) for i in range(dialog.provider_combo.count())]
+    assert titles == ["DaData", "Яндекс", "OpenStreetMap (без ключа)"], titles
+    assert "Ключи сохранены" in dialog.status_label.text()
+
+    plugin.open_keys("yandex")
+    assert keys_window().sections["yandex"].values() == ("yandex-key", "yandex-secret"), "ключи подставлены"
+    keys_window().reject()
+    APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def test_add_point_to_scratch_layer():
@@ -276,13 +330,12 @@ def test_nominatim_end_to_end():
     QSettings().setValue("GeoSearchRU/nominatim_url", f"http://127.0.0.1:{server.server_port}/search")
     try:
         dialog.set_provider("nominatim")
-        assert not dialog.token_edit.isVisibleTo(dialog) and not dialog.attribution_label.isHidden()
+        assert not dialog.attribution_label.isHidden()
         assert QSettings().value("GeoSearchRU/provider") == "nominatim"
 
         dialog.address_edit.setText("Тамбов, Энергетиков 7")
         dialog.search_button.click()
         wait_for_reply()
-        assert not dialog.token_edit.isVisibleTo(dialog), "после поиска поле токена остаётся скрытым"
         labels = [dialog.results_list.item(i).text() for i in range(dialog.results_list.count())]
         assert labels == [
             "7, проспект Энергетиков, Тамбов, Россия — дом",
@@ -335,14 +388,16 @@ def test_nominatim_precision_levels():
     assert parse({"place_rank": 30}).latitude is None
 
 
-def test_token_storage_is_optional():
-    dadata = plugin.providers["dadata"]
-    dialog.remember_token.setChecked(True)
-    plugin._save_credentials(dadata, "secret", "")
-    assert QSettings().value("GeoSearchRU/dadata_token") == "secret"
-    dialog.remember_token.setChecked(False)
-    plugin._save_credentials(dadata, "secret", "")
-    assert not QSettings().contains("GeoSearchRU/dadata_token")
+def test_keys_not_stored_when_unticked():
+    plugin.open_keys("dadata")
+    keys_window().remember.setChecked(False)
+    save_keys()
+    assert not QSettings().contains("GeoSearchRU/dadata_token") and not QSettings().contains("GeoSearchRU/yandex_key")
+    assert plugin.credentials["dadata"][0] == "dadata-token", "до закрытия QGIS ключ остаётся в памяти"
+    assert dialog.provider_combo.itemText(0) == "DaData"
+    plugin.open_keys("dadata")
+    keys_window().remember.setChecked(True)
+    save_keys()
 
 
 YANDEX_ANSWER = {"response": {"GeoObjectCollection": {
@@ -359,24 +414,85 @@ YANDEX_ANSWER = {"response": {"GeoObjectCollection": {
     ]}}}
 
 
-def test_yandex_keys_follow_the_source():
-    dialog.set_provider("dadata")
-    dialog.token_edit.setText("dadata-token")
-    dialog.set_provider("yandex")
-    assert dialog.token_edit.text() == "" and not dialog.secret_edit.isHidden()
-    assert "developer.tech.yandex.ru" in dialog.token_label.text() and "Яндекс" in dialog.attribution_label.text()
-    dialog.token_edit.setText("yandex-key")
-    dialog.secret_edit.setText("yandex-secret")
-    dialog.set_provider("dadata")
-    assert dialog.token_edit.text() == "dadata-token" and dialog.secret_edit.isHidden()
-    dialog.set_provider("yandex")
-    assert (dialog.token_edit.text(), dialog.secret_edit.text()) == ("yandex-key", "yandex-secret")
-    dialog.remember_token.setChecked(True)
-    plugin._save_credentials(plugin.providers["yandex"], "yandex-key", "yandex-secret")
-    assert QSettings().value("GeoSearchRU/yandex_key") == "yandex-key"
-    assert QSettings().value("GeoSearchRU/yandex_secret") == "yandex-secret"
-    assert QSettings().value("GeoSearchRU/dadata_token") != "yandex-key"
-    dialog.set_provider("dadata")
+class ScriptedStub(BaseHTTPRequestHandler):
+    """Answers requests with the next (status, body) from `script`, records method and path."""
+    script = []
+    seen = []
+
+    def _answer(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        ScriptedStub.seen.append((self.command, self.path))
+        status, body = ScriptedStub.script.pop(0)
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = do_POST = _answer
+
+    def log_message(self, *args):
+        pass
+
+
+def run_check(provider_id, host_attr, token, secret, script):
+    server = HTTPServer(("127.0.0.1", 0), ScriptedStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    ScriptedStub.script, ScriptedStub.seen = list(script), []
+    provider = plugin.providers[provider_id]
+    old = getattr(provider, host_attr)
+    base = f"http://127.0.0.1:{server.server_port}"
+    setattr(provider, host_attr, base if host_attr == "HOST" else base + "/suggest")
+    try:
+        plugin.open_keys(provider_id)
+        section = keys_window().sections[provider_id]
+        section.token_edit.setText(token)
+        section.secret_edit.setText(secret)
+        section.check_button.click()
+        timer = QElapsedTimer()
+        timer.start()
+        while not section.check_button.isEnabled() and timer.elapsed() < 10000:
+            APP.processEvents()
+            time.sleep(0.01)
+        return section.status_label.text(), list(ScriptedStub.seen)
+    finally:
+        setattr(provider, host_attr, old)
+        server.shutdown()
+
+
+def test_key_check_finds_working_yandex_signature():
+    QSettings().remove("GeoSearchRU/yandex_signature")
+    status, seen = run_check("yandex", "HOST", "KEY", "c2VjcmV0", [
+        (403, '{"statusCode":403,"error":"Forbidden","message":"Invalid signature"}'),
+        (200, json.dumps(YANDEX_ANSWER)),
+    ])
+    assert "Работает" in status and "392000" in status, status
+    assert len(seen) == 2 and all("&signature=" in path for _, path in seen), seen
+    assert seen[0][1] != seen[1][1], "второй запрос — с другой подписью"
+    assert QSettings().value("GeoSearchRU/yandex_signature") == "plain", "запомнен способ подписи, который сработал"
+    keys_window().reject()
+    APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_key_check_reports_bad_key():
+    status, seen = run_check("yandex", "HOST", "BAD", "", [
+        (403, '{"statusCode":403,"error":"Forbidden","message":"Invalid apikey"}'),
+    ])
+    assert len(seen) == 1 and "signature" not in seen[0][1], seen
+    assert "ошибку 403" in status and "Invalid apikey" in status, status
+    keys_window().reject()
+    APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_key_check_dadata():
+    status, seen = run_check("dadata", "URL", "TOKEN", "", [(200, json.dumps(SUGGESTIONS))])
+    assert seen and seen[0][0] == "POST", seen
+    assert "Работает" in status and "Энергетиков" in status, status
+    keys_window().reject()
+    APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def test_yandex_answer():
@@ -408,6 +524,7 @@ def test_yandex_request_and_signature():
     from datetime import datetime, timezone
     from GeoSearchRU.providers import Yandex
 
+    QSettings().remove("GeoSearchRU/yandex_signature")  # default: secret and time
     request, body = Yandex().request("Тамбов, Энергетиков 7", "KEY", 10)
     url = bytes(request.url().toEncoded()).decode()
     assert body is None and "signature" not in url, url
