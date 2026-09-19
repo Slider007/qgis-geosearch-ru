@@ -1,4 +1,3 @@
-import json
 import os
 
 from qgis.core import (
@@ -6,66 +5,62 @@ from qgis.core import (
     QgsMarkerSymbol, QgsNetworkAccessManager, QgsPointXY, QgsProject, QgsVectorLayer,
 )
 from qgis.gui import QgsVertexMarker
-from qgis.PyQt.QtCore import QSettings, QUrl
-from qgis.PyQt.QtGui import QAction, QColor, QIcon
+from qgis.PyQt.QtCore import QElapsedTimer, QSettings, QTimer
+from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
+
+try:
+    from qgis.PyQt.QtGui import QAction
+except ImportError:
+    from qgis.PyQt.QtWidgets import QAction
 
 from . import altan_toolbar
 from .geosearch_ru_dialog import GeoSearchDialog
-
-# DaData qc_geo: how precisely the coordinates match the address.
-QC_GEO_LABELS = {
-    0: "точные координаты дома",
-    1: "ближайший дом",
-    2: "улица",
-    3: "населённый пункт",
-    4: "город",
-}
-QC_GEO_SCALES = {0: 2500, 1: 2500, 2: 10000, 3: 50000, 4: 100000}
-COARSE_QC_GEO = 3
-DEFAULT_SCALE = 50000
+from .providers import Dadata, Nominatim, Yandex
 
 POINTS_LAYER_NAME = "Найденные адреса"
 POINTS_LAYER_URI = (
     "Point?crs=EPSG:4326&field=address:string&field=lat:double&field=lon:double"
-    "&field=precision:string&field=qc_geo:integer"
+    "&field=precision:string&field=source:string"
 )
 POINTS_FIELD_ALIASES = {
-    "address": "Адрес", "lat": "Широта", "lon": "Долгота", "precision": "Точность", "qc_geo": "Код точности DaData",
-}
-
-HTTP_ERROR_HINTS = {
-    400: "некорректный запрос",
-    401: "не указан API-токен",
-    403: "неверный токен, не подтверждена почта или исчерпан дневной лимит",
-    413: "слишком длинный запрос",
-    429: "слишком много запросов, повторите позже",
+    "address": "Адрес", "lat": "Широта", "lon": "Долгота", "precision": "Точность", "source": "Источник",
 }
 
 
 class GeoSearchRU:
-    API_URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address"
-    SETTINGS_TOKEN = "GeoSearchRU/dadata_token"
     SETTINGS_REMEMBER = "GeoSearchRU/remember_token"
-    MENU = "&Альтан-Эко"  # общее подменю модулей компании, строка должна совпадать буква в букву
+    SETTINGS_PROVIDER = "GeoSearchRU/provider"
     RESULT_COUNT = 10
     TIMEOUT_MS = 15000
 
     def __init__(self, iface):
         self.iface, self.action, self.dialog = iface, None, None
         self.marker = self.marker_wgs84 = self.reply = None
-        self.suggestions = []
+        self.reply_key = None  # (provider id, normalised query) of the request in flight
+        self.results = []
         self.points_layer_id = None
+        self.providers = {p.ID: p for p in (Dadata(), Yandex(), Nominatim())}
+        self.credentials = {}  # provider id → [key, secret] typed in the dialog
+        self.shown_provider = None  # provider whose keys are in the dialog fields
+        self.cache = {}  # (provider id, query) → results; Nominatim policy asks to cache repeated queries
+        self.last_request = {}  # provider id → QElapsedTimer since its last request
+        self.pending = None  # search waiting for the provider's minimum interval
+        self.throttle = QTimer()
+        self.throttle.setSingleShot(True)
+        self.throttle.timeout.connect(self._send_pending)
 
     def initGui(self):
         icon = QIcon(os.path.join(os.path.dirname(__file__), "resources", "geosearch_ru.svg"))
         self.action = QAction(icon, "Поиск адреса…", self.iface.mainWindow())
         self.action.triggered.connect(self.show_dialog)
         altan_toolbar.add_action(self.iface, self.action)
-        self.iface.addPluginToMenu(self.MENU, self.action)
+        altan_toolbar.add_to_menu(self.iface, self.action)
         self.iface.mapCanvas().destinationCrsChanged.connect(self._reposition_marker)
 
     def unload(self):
+        self.throttle.stop()
+        self.pending = None
         self._abort_request()
         self.iface.mapCanvas().destinationCrsChanged.disconnect(self._reposition_marker)
         self._clear_marker()
@@ -75,43 +70,87 @@ class GeoSearchRU:
             self.dialog = None
         if self.action:
             altan_toolbar.remove_action(self.iface, self.action)
-            self.iface.removePluginMenu(self.MENU, self.action)
+            altan_toolbar.remove_from_menu(self.iface, self.action)
             self.action.deleteLater()
             self.action = None
 
     def show_dialog(self):
         if self.dialog is None:
-            self.dialog = GeoSearchDialog(self.iface.mainWindow())
+            self.dialog = GeoSearchDialog([(p.ID, p.TITLE) for p in self.providers.values()], self.iface.mainWindow())
             settings = QSettings()
             remember = settings.value(self.SETTINGS_REMEMBER, True, type=bool)
             self.dialog.remember_token.setChecked(remember)
-            if remember:
-                self.dialog.token_edit.setText(settings.value(self.SETTINGS_TOKEN, "", type=str))
+            for provider in self.providers.values():
+                self.credentials[provider.ID] = [
+                    settings.value(key, "", type=str) if remember and key else ""
+                    for key in (provider.SETTINGS_TOKEN, provider.SETTINGS_SECRET)
+                ]
+            self.dialog.provider_combo.currentIndexChanged.connect(self._provider_changed)
+            self.dialog.set_provider(settings.value(self.SETTINGS_PROVIDER, Dadata.ID, type=str))
+            self._provider_changed()
             self.dialog.search_button.clicked.connect(self.search)
-            self.dialog.results_list.currentRowChanged.connect(self.show_suggestion)
+            self.dialog.results_list.currentRowChanged.connect(self.show_result)
             self.dialog.clear_button.clicked.connect(self.clear_result)
             self.dialog.add_point_button.clicked.connect(self.add_point)
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
 
+    def provider(self):
+        return self.providers.get(self.dialog.provider_combo.currentData(), self.providers[Dadata.ID])
+
+    def _provider_changed(self):
+        if self.shown_provider:
+            self.credentials[self.shown_provider] = [self.dialog.token_edit.text(), self.dialog.secret_edit.text()]
+        provider = self.provider()
+        self.shown_provider = provider.ID
+        token, secret = self.credentials.get(provider.ID, ["", ""])
+        self.dialog.token_edit.setText(token)
+        self.dialog.secret_edit.setText(secret)
+        QSettings().setValue(self.SETTINGS_PROVIDER, provider.ID)
+        self.dialog.show_provider(provider)
+
     def search(self):
-        address, token = self.dialog.address_edit.text().strip(), self.dialog.token_edit.text().strip()
-        if not address or not token:
-            self.dialog.set_status("Введите адрес и API-токен DaData.", "error")
+        provider = self.provider()
+        address = self.dialog.address_edit.text().strip()
+        token, secret = self.dialog.token_edit.text().strip(), self.dialog.secret_edit.text().strip()
+        if not address:
+            self.dialog.set_status("Введите адрес.", "error")
             return
-        self._save_token(token)
-        request = QNetworkRequest(QUrl(self.API_URL))
-        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
-        request.setRawHeader(b"Accept", b"application/json")
-        request.setRawHeader(b"Authorization", f"Token {token}".encode())
-        request.setTransferTimeout(self.TIMEOUT_MS)
-        self.suggestions = []
+        if provider.NEEDS_TOKEN:
+            if not token:
+                self.dialog.set_status(f"Введите: {provider.TOKEN_LABEL}.", "error")
+                return
+            self._save_credentials(provider, token, secret)
+        self.results = []
         self.dialog.clear_results()
+        key = (provider.ID, " ".join(address.lower().split()))
+        if key in self.cache:
+            self._show_results(provider, self.cache[key])
+            return
         self.dialog.set_busy(True)
-        body = json.dumps({"query": address, "count": self.RESULT_COUNT}).encode()
+        self.pending = (provider, key, address, token, secret)
+        timer = self.last_request.get(provider.ID)
+        wait = provider.MIN_INTERVAL_MS - timer.elapsed() if timer else 0
+        if wait > 0:
+            self.throttle.start(wait)
+        else:
+            self._send_pending()
+
+    def _send_pending(self):
+        if self.pending is None:
+            return
+        provider, key, address, token, secret = self.pending
+        self.pending = None
+        request, body = provider.request(address, token, self.RESULT_COUNT, secret)
+        request.setTransferTimeout(self.TIMEOUT_MS)
+        timer = QElapsedTimer()
+        timer.start()
+        self.last_request[provider.ID] = timer
         # QGIS network manager honours the proxy and SSL settings configured in QGIS.
-        self.reply = QgsNetworkAccessManager.instance().post(request, body)
+        manager = QgsNetworkAccessManager.instance()
+        self.reply_key = key
+        self.reply = manager.get(request) if body is None else manager.post(request, body)
         self.reply.finished.connect(self.handle_response)
 
     def handle_response(self):
@@ -119,67 +158,66 @@ class GeoSearchRU:
         if reply is None:
             return
         self.dialog.set_busy(False)
+        key, self.reply_key = self.reply_key, None
+        provider = self.providers[key[0]]
         try:
             body = bytes(reply.readAll()).decode("utf-8", errors="replace")
             if reply.error() != QNetworkReply.NetworkError.NoError:
-                self.dialog.set_status(self._error_message(reply, body), "error")
+                self.dialog.set_status(self._error_message(provider, reply, body), "error")
                 return
         finally:
             reply.deleteLater()
         try:
-            suggestions = json.loads(body)["suggestions"]
-        except (KeyError, TypeError, ValueError):
-            suggestions = None
-        if not isinstance(suggestions, list):
-            self.dialog.set_status("Не удалось разобрать ответ DaData.", "error")
+            results = provider.parse(body)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            self.dialog.set_status(f"Не удалось разобрать ответ {provider.SOURCE}.", "error")
             return
-        self.suggestions = [s for s in suggestions if isinstance(s, dict)]
-        if not self.suggestions:
+        self.cache[key] = results
+        self._show_results(provider, results)
+
+    def _show_results(self, provider, results):
+        self.results = [(provider, result) for result in results]
+        if not self.results:
             self.dialog.set_status("Адрес не найден.", "error")
             return
-        self.dialog.set_results([f"{self._address(s)} — {self._precision(s)}" for s in self.suggestions])
+        self.dialog.set_results([f"{r.address} — {r.precision}" for r in results])
 
-    def show_suggestion(self, row):
-        if not 0 <= row < len(self.suggestions):
+    def show_result(self, row):
+        if not 0 <= row < len(self.results):
             return
-        suggestion = self.suggestions[row]
-        address, coordinates = self._address(suggestion), self._coordinates(suggestion)
-        self.dialog.add_point_button.setEnabled(coordinates is not None)
-        if coordinates is None:
+        provider, result = self.results[row]
+        self.dialog.add_point_button.setEnabled(result.latitude is not None)
+        if result.latitude is None:
             self._clear_marker()
-            self.dialog.normalized_address.setPlainText(f"{address}\n\nКоординаты не определены.")
+            self.dialog.normalized_address.setPlainText(f"{result.address}\n\nКоординаты не определены.")
             self.dialog.set_status("У этого варианта нет координат.", "error")
             return
-        latitude, longitude = coordinates
-        qc_geo, precision = self._qc_geo(suggestion), self._precision(suggestion)
         self.dialog.normalized_address.setPlainText(
-            f"{address}\n\nКоординаты WGS 84:\nШирота: {latitude:.6f}\nДолгота: {longitude:.6f}\nТочность: {precision}"
+            f"{result.address}\n\nКоординаты WGS 84:\nШирота: {result.latitude:.6f}\n"
+            f"Долгота: {result.longitude:.6f}\nТочность: {result.precision}\nИсточник: {provider.SOURCE}"
         )
-        if not self.center_and_mark(longitude, latitude, QC_GEO_SCALES.get(qc_geo, DEFAULT_SCALE)):
+        if not self.center_and_mark(result.longitude, result.latitude, result.scale):
             self.dialog.set_status("Не удалось пересчитать координаты в систему координат проекта.", "error")
-        elif qc_geo is None or qc_geo >= COARSE_QC_GEO:
-            self.dialog.set_status(f"Координаты приблизительные ({precision}). Уточните адрес.", "warning")
+        elif result.coarse:
+            self.dialog.set_status(f"Координаты приблизительные ({result.precision}). Уточните адрес.", "warning")
         else:
             self.dialog.set_status("Адрес и координаты найдены.")
 
     def add_point(self):
         row = self.dialog.results_list.currentRow()
-        if not 0 <= row < len(self.suggestions):
+        if not 0 <= row < len(self.results):
             return
-        suggestion = self.suggestions[row]
-        coordinates = self._coordinates(suggestion)
-        if coordinates is None:
+        provider, result = self.results[row]
+        if result.latitude is None:
             return
-        latitude, longitude = coordinates
-        address = self._address(suggestion)
         layer = self._points_layer()
         for feature in layer.getFeatures():
-            if feature["address"] == address and feature["lat"] == latitude and feature["lon"] == longitude:
+            if (feature["address"], feature["lat"], feature["lon"]) == (result.address, result.latitude, result.longitude):
                 self.dialog.set_status(f"Этот адрес уже есть в слое «{layer.name()}».", "warning")
                 return
         feature = QgsFeature(layer.fields())
-        feature.setAttributes([address, latitude, longitude, self._precision(suggestion), self._qc_geo(suggestion)])
-        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(longitude, latitude)))
+        feature.setAttributes([result.address, result.latitude, result.longitude, result.precision, provider.SOURCE])
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(result.longitude, result.latitude)))
         layer.dataProvider().addFeatures([feature])
         layer.updateExtents()
         layer.triggerRepaint()
@@ -201,7 +239,7 @@ class GeoSearchRU:
 
     def clear_result(self):
         self._clear_marker()
-        self.suggestions = []
+        self.results = []
         self.dialog.clear_results()
         self.dialog.status_label.clear()
 
@@ -253,50 +291,24 @@ class GeoSearchRU:
             reply.abort()
             reply.deleteLater()
 
-    def _save_token(self, token):
+    def _save_credentials(self, provider, token, secret):
         settings = QSettings()
         remember = self.dialog.remember_token.isChecked()
         settings.setValue(self.SETTINGS_REMEMBER, remember)
-        if remember:
-            settings.setValue(self.SETTINGS_TOKEN, token)
-        else:
-            settings.remove(self.SETTINGS_TOKEN)
+        for key, value in ((provider.SETTINGS_TOKEN, token), (provider.SETTINGS_SECRET, secret)):
+            if key and remember and value:
+                settings.setValue(key, value)
+            elif key:
+                settings.remove(key)
 
     @staticmethod
-    def _error_message(reply, body):
+    def _error_message(provider, reply, body):
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         if status is None:
             if reply.error() == QNetworkReply.NetworkError.OperationCanceledError:
-                return "DaData не ответил вовремя. Проверьте подключение к интернету и настройки прокси в QGIS."
+                return (f"{provider.SOURCE} не ответил вовремя. "
+                        "Проверьте подключение к интернету и настройки прокси в QGIS.")
             return f"Сетевая ошибка: {reply.errorString()}"
-        message = f"DaData вернул ошибку {status}: {HTTP_ERROR_HINTS.get(int(status), reply.errorString())}"
-        try:
-            detail = json.loads(body).get("message")
-        except (ValueError, AttributeError):
-            detail = None
+        message = f"{provider.SOURCE} вернул ошибку {status}: {provider.HTTP_HINTS.get(int(status), reply.errorString())}"
+        detail = provider.error_detail(body)
         return f"{message} ({detail})" if detail else message
-
-    @staticmethod
-    def _address(suggestion):
-        return suggestion.get("unrestricted_value") or suggestion.get("value") or ""
-
-    @staticmethod
-    def _coordinates(suggestion):
-        data = suggestion.get("data") or {}
-        try:
-            return float(data["geo_lat"]), float(data["geo_lon"])
-        except (KeyError, TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _qc_geo(suggestion):
-        try:
-            return int((suggestion.get("data") or {}).get("qc_geo"))
-        except (TypeError, ValueError):
-            return None
-
-    @classmethod
-    def _precision(cls, suggestion):
-        if cls._coordinates(suggestion) is None:
-            return "без координат"
-        return QC_GEO_LABELS.get(cls._qc_geo(suggestion), "точность неизвестна")

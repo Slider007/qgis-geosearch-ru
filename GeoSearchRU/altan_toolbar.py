@@ -1,17 +1,24 @@
-"""Общая панель инструментов «Альтан-Эко» для всех модулей компании.
+"""Общая панель инструментов и подменю «Альтан-Эко» для всех модулей компании.
 
-Файл одинаковый во всех модулях (образец — shared/altan_toolbar.py в папке
-проектов). Панель ищется по objectName: первый загруженный модуль её создаёт,
+Файл одинаковый во всех модулях вместе с altan_logo.svg (образцы — папка
+shared/ в папке проектов). Панель ищется по objectName: первый загруженный модуль её создаёт,
 остальные добавляют на неё свои кнопки. Последний выгружаемый модуль её убирает.
 Панель можно открепить и перетащить куда угодно, место QGIS запоминает по
 objectName. Показать/скрыть — «Вид → Панели инструментов → Альтан-Эко».
 """
 
+import os
+
 from qgis.PyQt import sip
+from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QToolBar
 
 TOOLBAR_NAME = "Альтан-Эко"
 TOOLBAR_ID = "AltanEcoToolbar"  # не менять: по нему модули находят панель
+# Подменю в «Модулях»: QGIS объединяет пункты разных модулей по названию,
+# поэтому строка должна совпадать буква в букву, включая «&».
+MENU = "&Альтан-Эко"
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "altan_logo.svg")
 
 
 def _find(iface):
@@ -49,3 +56,18 @@ def remove_action(iface, action):
             bar.deleteLater()
     except RuntimeError:  # панель уже удалена при закрытии QGIS
         pass
+
+
+def add_to_menu(iface, action):
+    """Добавить пункт в подменю «Модули → Альтан-Эко» и поставить на подменю логотип."""
+    iface.addPluginToMenu(MENU, action)
+    # на macOS QGIS убирает «&» из названия подменю, поэтому сравнение без него
+    title = MENU.replace("&", "")
+    for item in iface.pluginMenu().actions():
+        if item.menu() is not None and item.text().replace("&", "") == title:
+            item.setIcon(QIcon(LOGO_PATH))
+
+
+def remove_from_menu(iface, action):
+    """Убрать пункт; пустое подменю QGIS убирает сам."""
+    iface.removePluginMenu(MENU, action)

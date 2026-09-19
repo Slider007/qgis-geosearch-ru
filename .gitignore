@@ -5,3 +5,4 @@ __pycache__/
 /tests/_profile/
 /tests/_out.log
 CLAUDE.local.md
+*.local.json

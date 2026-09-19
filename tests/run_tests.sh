@@ -1,5 +1,6 @@
 #!/bin/sh
 # Запуск проверок на Python из QGIS для macOS (QGIS-LTR.app или QGIS.app).
+# Без аргумента — tests/test_plugin.py; tests/run_tests.sh live_yandex.py — живая проверка Яндекса.
 # Другой путь к приложению: QGIS_APP=/Applications/QGIS-3.44.app tests/run_tests.sh
 set -e
 cd "$(dirname "$0")"
@@ -16,7 +17,7 @@ export PYTHONPATH="$C/Resources/python${PYTHONPATH:+:$PYTHONPATH}"
 export PROJ_DATA="$C/Resources/proj" PROJ_LIB="$C/Resources/proj"
 export QT_QPA_PLATFORM=offscreen
 set +e
-"$C/MacOS/bin/python3" test_plugin.py > _out.log 2>&1
+"$C/MacOS/bin/python3" "${1:-test_plugin.py}" > _out.log 2>&1
 STATUS=$?
 grep -v "proj_create_from_database\|Cannot find proj.db\|propagateSizeHints" _out.log
 rm -f _out.log
