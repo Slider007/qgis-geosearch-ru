@@ -528,6 +528,7 @@ def test_what_is_here():
     OverpassStub.bodies = []
     try:
         dialog.set_provider("dadata")  # источник поиска роли не играет
+        dialog.show_info_button(True)  # по умолчанию кнопка скрыта, см. test_info_button_hidden_by_default
         dialog.info_button.setChecked(True)
         assert plugin.click_mode == "info" and iface.canvas.mapTool() is plugin.map_tool
         dialog.pick_button.setChecked(True)
@@ -575,7 +576,17 @@ def test_what_is_here():
         dialog.info_button.setChecked(False)
         assert iface.canvas.mapTool() is not plugin.map_tool
     finally:
+        dialog.show_info_button(False)
         server.shutdown()
+
+
+def test_info_button_hidden_by_default():
+    assert not dialog.info_button.isVisibleTo(dialog), "«Что здесь?» скрыта, пока не включена настройкой"
+    assert QSettings().value("GeoSearchRU/what_is_here", type=bool) is False, "ключ виден в настройках QGIS"
+    dialog.show_info_button(True)
+    dialog.info_button.setChecked(True)
+    dialog.show_info_button(False)
+    assert not dialog.info_button.isChecked() and iface.canvas.mapTool() is not plugin.map_tool, "режим снимается"
 
 
 def test_what_is_here_empty_and_busy():

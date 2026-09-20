@@ -37,6 +37,7 @@ class GeoSearchRU:
     SETTINGS_REMEMBER = "GeoSearchRU/remember_token"
     SETTINGS_PROVIDER = "GeoSearchRU/provider"
     SETTINGS_BOUNDED = "GeoSearchRU/bounded"
+    SETTINGS_INFO = "GeoSearchRU/what_is_here"  # кнопка «Что здесь?»: по умолчанию скрыта
     RESULT_COUNT = 10
     CHECK_QUERY = "Москва, Красная площадь, 1"  # one known address for the key check
     TIMEOUT_MS = 15000
@@ -117,6 +118,10 @@ class GeoSearchRU:
             self.dialog.add_point_button.clicked.connect(self.add_point)
             self.dialog.pick_button.toggled.connect(lambda on: self.set_click_mode("address", on))
             self.dialog.info_button.toggled.connect(lambda on: self.set_click_mode("info", on))
+            if not settings.contains(self.SETTINGS_INFO):
+                # Пишется в настройки, чтобы ключ был виден в «Параметры → Дополнительно».
+                settings.setValue(self.SETTINGS_INFO, False)
+            self.dialog.show_info_button(settings.value(self.SETTINGS_INFO, False, type=bool))
             self.dialog.bounded.setChecked(settings.value(self.SETTINGS_BOUNDED, False, type=bool))
             self.dialog.bounded.toggled.connect(
                 lambda checked: QSettings().setValue(self.SETTINGS_BOUNDED, checked))

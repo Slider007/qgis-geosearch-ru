@@ -39,6 +39,7 @@ class GeoSearchDialog(QDialog):
         self.info_button = QPushButton("Что здесь?")
         self.info_button.setCheckable(True)
         self.info_button.setAutoDefault(False)
+        self.info_button.setVisible(False)  # показывается настройкой, см. show_info_button
         self.info_button.setToolTip(
             "Щёлкнуть по карте и увидеть объекты OpenStreetMap в этой точке: "
             "здание, участок, дорогу, ЛЭП, а также границы, внутри которых точка лежит")
@@ -95,6 +96,12 @@ class GeoSearchDialog(QDialog):
             title = titles.get(self.provider_combo.itemData(index))
             if title:
                 self.provider_combo.setItemText(index, title)
+
+    def show_info_button(self, visible):
+        """«Что здесь?» по умолчанию скрыта: возможность есть, но окно не загромождает."""
+        self.info_button.setVisible(visible)
+        if not visible:
+            self.info_button.setChecked(False)
 
     def show_attribution(self, provider):
         self.attribution_label.setText(provider.ATTRIBUTION or "")
