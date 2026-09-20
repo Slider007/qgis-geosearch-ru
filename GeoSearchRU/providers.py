@@ -2,6 +2,9 @@
 
 Every provider turns a response into a list of Result objects, so the dialog,
 the marker and the points layer do not depend on the service.
+
+A provider answers three calls: request() for an address, reverse() for a point
+on the map, and parse() for the body that comes back.
 """
 
 import base64
@@ -17,18 +20,27 @@ from qgis.PyQt.QtNetwork import QNetworkRequest
 
 PLUGIN_URL = "https://github.com/Slider007/qgis-geosearch-ru"
 
-# precision: text for the user; coarse: coordinates are not at house level; scale: map scale to zoom to.
-Result = namedtuple("Result", "address latitude longitude precision coarse scale")
+# precision: text for the user; coarse: coordinates are not at house level; scale: map scale to zoom to;
+# parts: the address split into fields (see PART_FIELDS), as far as the service reports them.
+Result = namedtuple("Result", "address latitude longitude precision coarse scale parts")
 
 NO_COORDINATES = "без координат"
 
+# Address fields every provider fills in as far as it can; they become columns of the points layer.
+PART_FIELDS = ("postcode", "region", "area", "city", "street", "house", "fias", "oktmo", "okato")
 
-def _result(address, latitude, longitude, precision, coarse, scale):
+
+def _parts(**values):
+    """Only the fields the service actually reported, in PART_FIELDS order."""
+    return {name: str(values[name]).strip() for name in PART_FIELDS if values.get(name)}
+
+
+def _result(address, latitude, longitude, precision, coarse, scale, parts=None):
     try:
         latitude, longitude = float(latitude), float(longitude)
     except (TypeError, ValueError):
-        return Result(address, None, None, NO_COORDINATES, True, None)
-    return Result(address, latitude, longitude, precision, coarse, scale)
+        return Result(address, None, None, NO_COORDINATES, True, None, parts or {})
+    return Result(address, latitude, longitude, precision, coarse, scale, parts or {})
 
 
 def _json_message(body):
@@ -59,6 +71,10 @@ class Dadata:
     ATTRIBUTION = None
     MIN_INTERVAL_MS = 0
     URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address"
+    REVERSE_URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/geolocate/address"
+    REVERSE_RADIUS_M = 1000  # the largest radius the geolocate method allows
+    # locations_geo takes a circle, not the map extent, so the map frame is not offered for DaData.
+    SUPPORTS_BBOX = False
     HTTP_HINTS = {
         400: "некорректный запрос",
         401: "не указан API-токен",
@@ -75,12 +91,21 @@ class Dadata:
         4: ("город", 100000),
     }
 
-    def request(self, query, token, count, secret="", signature_mode=None):
-        request = QNetworkRequest(QUrl(self.URL))
+    def request(self, query, token, count, secret="", signature_mode=None, bbox=None):
+        return self._post(self.URL, {"query": query, "count": count}, token)
+
+    def reverse(self, latitude, longitude, token, count, secret="", signature_mode=None):
+        """Addresses near a point, nearest first (https://dadata.ru/api/geolocate/)."""
+        payload = {"lat": latitude, "lon": longitude, "count": count, "radius_meters": self.REVERSE_RADIUS_M}
+        return self._post(self.REVERSE_URL, payload, token)
+
+    @staticmethod
+    def _post(url, payload, token):
+        request = QNetworkRequest(QUrl(url))
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
         request.setRawHeader(b"Accept", b"application/json")
         request.setRawHeader(b"Authorization", f"Token {token}".encode())
-        return request, json.dumps({"query": query, "count": count}).encode()
+        return request, json.dumps(payload).encode()
 
     def parse(self, body):
         suggestions = json.loads(body)["suggestions"]
@@ -96,7 +121,14 @@ class Dadata:
             qc_geo = None
         precision, scale = self.QC_GEO.get(qc_geo, ("точность неизвестна", 50000))
         address = suggestion.get("unrestricted_value") or suggestion.get("value") or ""
-        return _result(address, data.get("geo_lat"), data.get("geo_lon"), precision, qc_geo is None or qc_geo >= 3, scale)
+        parts = _parts(
+            postcode=data.get("postal_code"), region=data.get("region_with_type"), area=data.get("area_with_type"),
+            city=data.get("city_with_type") or data.get("settlement_with_type"), street=data.get("street_with_type"),
+            house=" ".join(p for p in (data.get("house"), data.get("block")) if p),
+            fias=data.get("fias_id"), oktmo=data.get("oktmo"), okato=data.get("okato"),
+        )
+        return _result(address, data.get("geo_lat"), data.get("geo_lon"), precision,
+                       qc_geo is None or qc_geo >= 3, scale, parts)
 
     error_detail = staticmethod(_json_message)
 
@@ -123,6 +155,7 @@ class Nominatim:
         '<a href="https://operations.osmfoundation.org/policies/nominatim/">правила использования</a>.'
     )
     MIN_INTERVAL_MS = 1000
+    SUPPORTS_BBOX = True
     DEFAULT_URL = "https://nominatim.openstreetmap.org/search"
     SETTINGS_URL = "GeoSearchRU/nominatim_url"
     HTTP_HINTS = {
@@ -131,31 +164,55 @@ class Nominatim:
         429: "слишком много запросов: не чаще раза в секунду, повторите позже",
     }
 
-    def url(self):
+    def url(self, endpoint="search"):
         settings = QSettings()
         if not settings.contains(self.SETTINGS_URL):
             # Written out so the key shows up in QGIS Options → Advanced, where it can be changed.
             settings.setValue(self.SETTINGS_URL, self.DEFAULT_URL)
-        return settings.value(self.SETTINGS_URL, "", type=str).strip() or self.DEFAULT_URL
+        address = settings.value(self.SETTINGS_URL, "", type=str).strip() or self.DEFAULT_URL
+        if endpoint == "search":
+            return address
+        # Reverse geocoding lives next to search: …/search → …/reverse.
+        head, slash, _ = address.rstrip("/").rpartition("/")
+        return f"{head}{slash}{endpoint}" if slash else address
 
-    def request(self, query, token, count, secret="", signature_mode=None):
-        url = QUrl(self.url())
-        params = QUrlQuery()
-        for key, value in (
+    def request(self, query, token, count, secret="", signature_mode=None, bbox=None):
+        params = [
             ("q", query), ("format", "jsonv2"), ("addressdetails", "1"), ("limit", str(count)),
             ("countrycodes", "ru"), ("accept-language", "ru"),
-        ):
-            params.addQueryItem(key, value)
-        url.setQuery(params)
+        ]
+        if bbox:
+            # viewbox is x1,y1,x2,y2 (longitude, latitude); bounded=1 makes it a limit, not a preference.
+            params += [("viewbox", "{:.6f},{:.6f},{:.6f},{:.6f}".format(*bbox)), ("bounded", "1")]
+        return self._get(self.url(), params), None
+
+    def reverse(self, latitude, longitude, token, count, secret="", signature_mode=None):
+        """The one address at a point (https://nominatim.org/release-docs/latest/api/Reverse/)."""
+        params = [
+            ("lat", f"{latitude:.7f}"), ("lon", f"{longitude:.7f}"), ("format", "jsonv2"),
+            ("addressdetails", "1"), ("zoom", "18"), ("accept-language", "ru"),
+        ]
+        return self._get(self.url("reverse"), params), None
+
+    @staticmethod
+    def _get(address, params):
+        url = QUrl(address)
+        query = QUrlQuery()
+        for key, value in params:
+            query.addQueryItem(key, value)
+        url.setQuery(query)
         request = QNetworkRequest(url)
         request.setRawHeader(b"Accept", b"application/json")
         # The policy asks every application to identify itself by User-Agent or Referer.
         # QgsNetworkAccessManager replaces User-Agent with its own "QGIS/…", so Referer it is.
         request.setRawHeader(b"Referer", PLUGIN_URL.encode())
-        return request, None
+        return request
 
     def parse(self, body):
         places = json.loads(body)
+        if isinstance(places, dict):
+            # /reverse answers with one place, or with {"error": "Unable to geocode"}.
+            places = [] if places.get("error") else [places]
         if not isinstance(places, list):
             raise ValueError("response is not a list")
         return [self._parse_one(p) for p in places if isinstance(p, dict)]
@@ -166,7 +223,8 @@ class Nominatim:
             rank = int(place.get("place_rank"))
         except (TypeError, ValueError):
             rank = 0
-        has_house = bool((place.get("address") or {}).get("house_number"))
+        address = place.get("address") or {}
+        has_house = bool(address.get("house_number"))
         # place_rank: 30 — building, 26–27 — street, 17–25 — village or district, 16 and below — city or larger.
         if has_house or rank >= 28:
             precision, coarse, scale = "дом", False, 2500
@@ -176,7 +234,13 @@ class Nominatim:
             precision, coarse, scale = "населённый пункт или район", True, 50000
         else:
             precision, coarse, scale = "город или крупнее", True, 100000
-        return _result(place.get("display_name") or "", place.get("lat"), place.get("lon"), precision, coarse, scale)
+        parts = _parts(
+            postcode=address.get("postcode"), region=address.get("state"), area=address.get("county"),
+            city=address.get("city") or address.get("town") or address.get("village") or address.get("hamlet"),
+            street=address.get("road"), house=address.get("house_number"),
+        )
+        return _result(place.get("display_name") or "", place.get("lat"), place.get("lon"),
+                       precision, coarse, scale, parts)
 
     error_detail = staticmethod(_json_message)
 
@@ -204,6 +268,7 @@ class Yandex:
     SIGNATURE_MODES = ("ttl", "plain")
     ATTRIBUTION = 'Данные © <a href="https://yandex.ru/legal/maps_api/">Яндекс</a>.'
     MIN_INTERVAL_MS = 0
+    SUPPORTS_BBOX = True
     HOST = "https://geocode-maps.yandex.ru"
     HTTP_HINTS = {
         400: "некорректный запрос",
@@ -218,6 +283,10 @@ class Yandex:
         "range": ("приблизительные координаты дома", False, 2500),
         "street": ("улица", False, 10000),
     }
+    # Address.Components[].kind → address field.
+    COMPONENT_FIELDS = {
+        "province": "region", "area": "area", "locality": "city", "street": "street", "house": "house",
+    }
     # GeocoderMetaData.kind when no house or street matched.
     KIND_PRECISION = {
         "district": ("район города", True, 25000),
@@ -227,8 +296,12 @@ class Yandex:
         "country": ("страна", True, 10000000),
     }
 
-    def request(self, query, token, count, secret="", signature_mode=None):
-        params = [("geocode", query), ("lang", "ru_RU"), ("format", "json"), ("results", str(count)), ("apikey", token)]
+    def request(self, query, token, count, secret="", signature_mode=None, bbox=None):
+        params = [("geocode", query), ("lang", "ru_RU"), ("format", "json"), ("results", str(count))]
+        if bbox:
+            # bbox corners are «longitude,latitude» of the lower left and upper right; rspn=1 makes it a limit.
+            params += [("bbox", "{:.6f},{:.6f}~{:.6f},{:.6f}".format(*bbox)), ("rspn", "1")]
+        params.append(("apikey", token))
         path = "/v1/?" + "&".join(f"{k}={quote(v, safe='')}" for k, v in params)
         if secret:
             mode = signature_mode or QSettings().value(self.SETTINGS_SIGNATURE, "ttl", type=str)
@@ -237,6 +310,10 @@ class Yandex:
         request = QNetworkRequest(QUrl.fromEncoded((self.HOST + path).encode()))
         request.setRawHeader(b"Accept", b"application/json")
         return request, None
+
+    def reverse(self, latitude, longitude, token, count, secret="", signature_mode=None):
+        """Same endpoint: coordinates in geocode mean reverse geocoding, longitude first (sco=longlat)."""
+        return self.request(f"{longitude:.6f},{latitude:.6f}", token, count, secret, signature_mode)
 
     @staticmethod
     def signature(path, secret, mode="ttl", now=None):
@@ -260,13 +337,20 @@ class Yandex:
         else:
             label, coarse, scale = self.KIND_PRECISION.get(kind, ("объект, не адрес", True, 10000))
         address = meta.get("text") or geo.get("name") or ""
-        postal = (meta.get("Address") or {}).get("postal_code")
+        block = meta.get("Address") or {}
+        postal = block.get("postal_code")
         if postal:
             address = f"{postal}, {address}"
+        values = {"postcode": postal}
+        for component in block.get("Components") or []:
+            field = self.COMPONENT_FIELDS.get(component.get("kind"))
+            if field:
+                # Two «province» components come back: the federal district first, the region second.
+                values[field] = component.get("name")
         try:
             longitude, latitude = (geo.get("Point") or {}).get("pos", "").split()
         except ValueError:
             longitude = latitude = None
-        return _result(address, latitude, longitude, label, coarse, scale)
+        return _result(address, latitude, longitude, label, coarse, scale, _parts(**values))
 
     error_detail = staticmethod(_json_message)

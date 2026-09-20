@@ -4,7 +4,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsFeature, QgsGeometry,
     QgsMarkerSymbol, QgsNetworkAccessManager, QgsPointXY, QgsProject, QgsVectorLayer,
 )
-from qgis.gui import QgsVertexMarker
+from qgis.gui import QgsMapToolEmitPoint, QgsVertexMarker
 from qgis.PyQt.QtCore import QElapsedTimer, QSettings, QTimer
 from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
@@ -18,21 +18,24 @@ except ImportError:
 from . import altan_toolbar
 from .geosearch_ru_dialog import GeoSearchDialog
 from .keys_dialog import KeysDialog
-from .providers import Dadata, Nominatim, Yandex
+from .providers import Dadata, Nominatim, PART_FIELDS, Yandex
 
 POINTS_LAYER_NAME = "Найденные адреса"
 POINTS_LAYER_URI = (
     "Point?crs=EPSG:4326&field=address:string&field=lat:double&field=lon:double"
-    "&field=precision:string&field=source:string"
+    "&field=precision:string&field=source:string" + "".join(f"&field={name}:string" for name in PART_FIELDS)
 )
 POINTS_FIELD_ALIASES = {
     "address": "Адрес", "lat": "Широта", "lon": "Долгота", "precision": "Точность", "source": "Источник",
+    "postcode": "Индекс", "region": "Регион", "area": "Район", "city": "Город или населённый пункт",
+    "street": "Улица", "house": "Дом", "fias": "Код ФИАС", "oktmo": "ОКТМО", "okato": "ОКАТО",
 }
 
 
 class GeoSearchRU:
     SETTINGS_REMEMBER = "GeoSearchRU/remember_token"
     SETTINGS_PROVIDER = "GeoSearchRU/provider"
+    SETTINGS_BOUNDED = "GeoSearchRU/bounded"
     RESULT_COUNT = 10
     CHECK_QUERY = "Москва, Красная площадь, 1"  # one known address for the key check
     TIMEOUT_MS = 15000
@@ -41,6 +44,8 @@ class GeoSearchRU:
         self.iface, self.action, self.dialog = iface, None, None
         self.marker = self.marker_wgs84 = self.reply = None
         self.reply_key = None  # (provider id, normalised query) of the request in flight
+        self.map_tool = None  # «адрес по точке на карте»
+        self.keep_view = False  # a reverse search leaves the map where the user clicked
         self.results = []
         self.points_layer_id = None
         self.providers = {p.ID: p for p in (Dadata(), Yandex(), Nominatim())}
@@ -72,6 +77,11 @@ class GeoSearchRU:
             self.keys_dialog.deleteLater()
             self.keys_dialog = None
         self.iface.mapCanvas().destinationCrsChanged.disconnect(self._reposition_marker)
+        if self.map_tool is not None:
+            self.map_tool.deactivated.disconnect(self._tool_deactivated)
+            self.iface.mapCanvas().unsetMapTool(self.map_tool)
+            self.map_tool.deleteLater()
+            self.map_tool = None
         self._clear_marker()
         if self.dialog:
             self.dialog.close()
@@ -101,6 +111,10 @@ class GeoSearchRU:
             self.dialog.results_list.currentRowChanged.connect(self.show_result)
             self.dialog.clear_button.clicked.connect(self.clear_result)
             self.dialog.add_point_button.clicked.connect(self.add_point)
+            self.dialog.pick_button.toggled.connect(self.pick_point)
+            self.dialog.bounded.setChecked(settings.value(self.SETTINGS_BOUNDED, False, type=bool))
+            self.dialog.bounded.toggled.connect(
+                lambda checked: QSettings().setValue(self.SETTINGS_BOUNDED, checked))
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
@@ -124,22 +138,27 @@ class GeoSearchRU:
     def search(self):
         provider = self.provider()
         address = self.dialog.address_edit.text().strip()
-        token, secret = self.credentials.get(provider.ID, ["", ""])
         if not address:
             self.dialog.set_status("Введите адрес.", "error")
             return
+        bbox = self._map_bbox() if self.dialog.bounded.isChecked() and provider.SUPPORTS_BBOX else None
+        key = (provider.ID, " ".join(address.lower().split()), bbox)
+        self._start(provider, key,
+                    lambda token, secret: provider.request(address, token, self.RESULT_COUNT, secret, None, bbox))
+
+    def _start(self, provider, key, build):
+        """Run one request, respecting the provider's minimum interval and the answer cache."""
         if not self._has_key(provider):
             self.dialog.set_status(f"Для источника «{provider.SOURCE}» нужен ключ — впишите его в окне «Ключи».", "error")
             self.open_keys(provider.ID)
             return
         self.results = []
         self.dialog.clear_results()
-        key = (provider.ID, " ".join(address.lower().split()))
         if key in self.cache:
-            self._show_results(provider, self.cache[key])
+            self._show_results(provider, self.cache[key], key)
             return
         self.dialog.set_busy(True)
-        self.pending = (provider, key, address, token, secret)
+        self.pending = (provider, key, build)
         timer = self.last_request.get(provider.ID)
         wait = provider.MIN_INTERVAL_MS - timer.elapsed() if timer else 0
         if wait > 0:
@@ -150,9 +169,10 @@ class GeoSearchRU:
     def _send_pending(self):
         if self.pending is None:
             return
-        provider, key, address, token, secret = self.pending
+        provider, key, build = self.pending
         self.pending = None
-        request, body = provider.request(address, token, self.RESULT_COUNT, secret)
+        token, secret = self.credentials.get(provider.ID, ["", ""])
+        request, body = build(token, secret)
         request.setTransferTimeout(self.TIMEOUT_MS)
         timer = QElapsedTimer()
         timer.start()
@@ -183,19 +203,28 @@ class GeoSearchRU:
             self.dialog.set_status(f"Не удалось разобрать ответ {provider.SOURCE}.", "error")
             return
         self.cache[key] = results
-        self._show_results(provider, results)
+        self._show_results(provider, results, key)
 
-    def _show_results(self, provider, results):
+    def _show_results(self, provider, results, key=None):
         self.results = [(provider, result) for result in results]
         if not self.results:
-            self.dialog.set_status("Адрес не найден.", "error")
+            self.dialog.set_status(self._nothing_found(key), "error")
             return
         self.dialog.set_results([f"{r.address} — {r.precision}" for r in results])
+
+    @staticmethod
+    def _nothing_found(key):
+        if key and str(key[1]).startswith("reverse:"):
+            return "В этой точке адрес не найден. Щёлкните ближе к дому или улице."
+        if key and len(key) > 2 and key[2]:
+            return "Адрес не найден в пределах карты. Снимите галочку или сдвиньте карту."
+        return "Адрес не найден."
 
     def show_result(self, row):
         if not 0 <= row < len(self.results):
             return
         provider, result = self.results[row]
+        keep_view, self.keep_view = self.keep_view, False
         self.dialog.add_point_button.setEnabled(result.latitude is not None)
         if result.latitude is None:
             self._clear_marker()
@@ -206,7 +235,7 @@ class GeoSearchRU:
             f"{result.address}\n\nКоординаты WGS 84:\nШирота: {result.latitude:.6f}\n"
             f"Долгота: {result.longitude:.6f}\nТочность: {result.precision}\nИсточник: {provider.SOURCE}"
         )
-        if not self.center_and_mark(result.longitude, result.latitude, result.scale):
+        if not self.center_and_mark(result.longitude, result.latitude, result.scale, recenter=not keep_view):
             self.dialog.set_status("Не удалось пересчитать координаты в систему координат проекта.", "error")
         elif result.coarse:
             self.dialog.set_status(f"Координаты приблизительные ({result.precision}). Уточните адрес.", "warning")
@@ -226,7 +255,12 @@ class GeoSearchRU:
                 self.dialog.set_status(f"Этот адрес уже есть в слое «{layer.name()}».", "warning")
                 return
         feature = QgsFeature(layer.fields())
-        feature.setAttributes([result.address, result.latitude, result.longitude, result.precision, provider.SOURCE])
+        values = dict(result.parts or {})
+        values.update(address=result.address, lat=result.latitude, lon=result.longitude,
+                      precision=result.precision, source=provider.SOURCE)
+        for name, value in values.items():
+            if layer.fields().indexOf(name) >= 0:
+                feature[name] = value
         feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(result.longitude, result.latitude)))
         layer.dataProvider().addFeatures([feature])
         layer.updateExtents()
@@ -253,15 +287,16 @@ class GeoSearchRU:
         self.dialog.clear_results()
         self.dialog.status_label.clear()
 
-    def center_and_mark(self, longitude, latitude, scale):
+    def center_and_mark(self, longitude, latitude, scale, recenter=True):
         self._clear_marker()
         wgs84 = QgsPointXY(longitude, latitude)
         point = self._to_canvas(wgs84)
         if point is None:
             return False
         canvas = self.iface.mapCanvas()
-        canvas.setCenter(point)
-        canvas.zoomScale(scale)
+        if recenter:
+            canvas.setCenter(point)
+            canvas.zoomScale(scale)
         self.marker_wgs84 = wgs84
         self.marker = QgsVertexMarker(canvas)
         self.marker.setCenter(point)
@@ -270,6 +305,60 @@ class GeoSearchRU:
         self.marker.setIconSize(18)
         self.marker.setPenWidth(3)
         return True
+
+    def pick_point(self, enabled):
+        """«Адрес по точке на карте»: hand the canvas a click tool and search by the point clicked."""
+        canvas = self.iface.mapCanvas()
+        if not enabled:
+            if self.map_tool is not None and canvas.mapTool() is self.map_tool:
+                canvas.unsetMapTool(self.map_tool)
+            return
+        if self.map_tool is None:
+            self.map_tool = QgsMapToolEmitPoint(canvas)
+            self.map_tool.canvasClicked.connect(self._point_picked)
+            # The user can switch to another tool on the toolbar: the button has to follow.
+            self.map_tool.deactivated.connect(self._tool_deactivated)
+        canvas.setMapTool(self.map_tool)
+        self.dialog.set_status(f"Щёлкните по карте — {self.provider().SOURCE} найдёт ближайший адрес.")
+
+    def _tool_deactivated(self):
+        if self.dialog:
+            self.dialog.pick_button.setChecked(False)
+
+    def _point_picked(self, point, _button=None):
+        wgs84 = self._to_wgs84(point)
+        if wgs84 is None:
+            self.dialog.set_status("Не удалось пересчитать точку в WGS 84.", "error")
+            return
+        provider = self.provider()
+        latitude, longitude = round(wgs84.y(), 6), round(wgs84.x(), 6)
+        key = (provider.ID, f"reverse:{latitude},{longitude}")
+        self.keep_view = True  # the user is looking at the place already
+        self._start(provider, key,
+                    lambda token, secret: provider.reverse(latitude, longitude, token, self.RESULT_COUNT, secret))
+
+    def _map_bbox(self):
+        """Visible map extent as (min lon, min lat, max lon, max lat) in WGS 84."""
+        canvas = self.iface.mapCanvas()
+        transform = QgsCoordinateTransform(
+            canvas.mapSettings().destinationCrs(), QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance())
+        try:
+            extent = transform.transformBoundingBox(canvas.extent())
+        except QgsCsException:
+            return None
+        if extent.isEmpty():
+            return None
+        return (round(extent.xMinimum(), 6), round(extent.yMinimum(), 6),
+                round(extent.xMaximum(), 6), round(extent.yMaximum(), 6))
+
+    def _to_wgs84(self, canvas_point):
+        transform = QgsCoordinateTransform(
+            self.iface.mapCanvas().mapSettings().destinationCrs(),
+            QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance())
+        try:
+            return transform.transform(canvas_point)
+        except QgsCsException:
+            return None
 
     def _to_canvas(self, wgs84_point):
         canvas_crs = self.iface.mapCanvas().mapSettings().destinationCrs()

@@ -26,7 +26,9 @@ QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, PROFILE
 QCoreApplication.setOrganizationName("geosearch-ru-tests")
 QCoreApplication.setApplicationName("geosearch-ru-tests")
 
-from qgis.core import QgsApplication, QgsCoordinateReferenceSystem, QgsProject  # noqa: E402
+from qgis.core import (  # noqa: E402
+    NULL, QgsApplication, QgsCoordinateReferenceSystem, QgsPointXY, QgsProject, QgsRectangle,
+)
 from qgis.gui import QgsMapCanvas  # noqa: E402
 from qgis.PyQt.QtNetwork import QNetworkReply  # noqa: E402
 from qgis.PyQt.QtWidgets import QDialogButtonBox, QLabel, QMainWindow, QMenu, QToolBar  # noqa: E402
@@ -45,7 +47,10 @@ NO_ERROR = QNetworkReply.NetworkError.NoError
 SUGGESTIONS = {"suggestions": [
     {"value": "г Тамбов, пр-кт Энергетиков, д 7",
      "unrestricted_value": "392000, Тамбовская обл, г Тамбов, пр-кт Энергетиков, д 7",
-     "data": {"geo_lat": "52.72", "geo_lon": "41.45", "qc_geo": "0"}},
+     "data": {"geo_lat": "52.72", "geo_lon": "41.45", "qc_geo": "0", "postal_code": "392000",
+              "region_with_type": "Тамбовская обл", "city_with_type": "г Тамбов",
+              "street_with_type": "пр-кт Энергетиков", "house": "7", "block": "к 1",
+              "fias_id": "1b0b3f5a-0000-4000-8000-000000000001", "oktmo": "68701000001", "okato": "68401000000"}},
     {"value": "г Тамбов", "data": {"geo_lat": "52.72", "geo_lon": "41.45", "qc_geo": "4"}},
     {"value": "г Тамбов, ул Несуществующая", "data": {"geo_lat": None, "geo_lon": None, "qc_geo": "5"}},
 ]}
@@ -254,6 +259,13 @@ def test_add_point_to_scratch_layer():
     assert abs(point.x() - 41.45) < 1e-9 and abs(point.y() - 52.72) < 1e-9, point.toString()
     assert layer.attributeDisplayName(layer.fields().indexOf("lat")) == "Широта"
 
+    parts = {name: feature[name] for name in ("postcode", "region", "city", "street", "house", "oktmo", "okato")}
+    assert parts == {"postcode": "392000", "region": "Тамбовская обл", "city": "г Тамбов",
+                     "street": "пр-кт Энергетиков", "house": "7 к 1", "oktmo": "68701000001",
+                     "okato": "68401000000"}, parts
+    assert feature["fias"] == "1b0b3f5a-0000-4000-8000-000000000001"
+    assert layer.attributeDisplayName(layer.fields().indexOf("oktmo")) == "ОКТМО"
+
     dialog.add_point_button.click()
     assert layer.featureCount() == 1 and "уже есть" in dialog.status_label.text(), dialog.status_label.text()
 
@@ -299,12 +311,22 @@ NOMINATIM_ANSWER = [
 ]
 
 
+NOMINATIM_REVERSE = {
+    "lat": "52.7201", "lon": "41.4502", "place_rank": 30,
+    "display_name": "7, проспект Энергетиков, Тамбов, 392000, Россия",
+    "address": {"house_number": "7", "road": "проспект Энергетиков", "city": "Тамбов",
+                "state": "Тамбовская область", "postcode": "392000"},
+}
+
+
 class NominatimStub(BaseHTTPRequestHandler):
     requests = []
 
     def do_GET(self):
         NominatimStub.requests.append((time.monotonic(), self.path, dict(self.headers)))
-        body = json.dumps(NOMINATIM_ANSWER).encode()
+        # /reverse answers with one place, /search with a list.
+        answer = NOMINATIM_REVERSE if "/reverse" in self.path else NOMINATIM_ANSWER
+        body = json.dumps(answer).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -386,6 +408,100 @@ def test_nominatim_precision_levels():
     village = parse({"lat": "1", "lon": "2", "place_rank": 19})
     assert village.precision == "населённый пункт или район" and village.coarse and village.scale == 50000
     assert parse({"place_rank": 30}).latitude is None
+
+
+def nominatim_server():
+    server = HTTPServer(("127.0.0.1", 0), NominatimStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    QSettings().setValue("GeoSearchRU/nominatim_url", f"http://127.0.0.1:{server.server_port}/search")
+    NominatimStub.requests = []
+    return server
+
+
+def last_query():
+    return parse_qs(urlparse(NominatimStub.requests[-1][1]).query)
+
+
+def test_map_frame_limits_search():
+    server = nominatim_server()
+    try:
+        dialog.set_provider("dadata")
+        assert not dialog.bounded.isEnabled(), "DaData рамку карты не умеет"
+        dialog.set_provider("nominatim")
+        assert dialog.bounded.isEnabled()
+        iface.canvas.setExtent(QgsRectangle(4613000, 6930000, 4615000, 6932000))
+        dialog.bounded.setChecked(True)
+        assert QSettings().value("GeoSearchRU/bounded", type=bool), "галочка запоминается"
+        dialog.address_edit.setText("Энергетиков 7")
+        dialog.search_button.click()
+        wait_for_reply()
+        query = last_query()
+        assert query["bounded"] == ["1"], query
+        box = [float(v) for v in query["viewbox"][0].split(",")]
+        assert 41.3 < box[0] < 41.5 and 52.6 < box[1] < 52.8, box
+        assert box[0] < box[2] and box[1] < box[3], box
+
+        dialog.bounded.setChecked(False)
+        dialog.address_edit.setText("Энергетиков 7")
+        dialog.search_button.click()
+        wait_for_reply()
+        assert "viewbox" not in last_query(), "без галочки рамка не отправляется"
+    finally:
+        dialog.bounded.setChecked(False)
+        server.shutdown()
+        dialog.set_provider("dadata")
+
+
+def test_address_by_map_click():
+    server = nominatim_server()
+    try:
+        dialog.set_provider("nominatim")
+        iface.canvas.setExtent(QgsRectangle(4613000, 6930000, 4615000, 6932000))
+        scale, center = iface.canvas.scale(), iface.canvas.center()
+        dialog.pick_button.setChecked(True)
+        assert iface.canvas.mapTool() is plugin.map_tool, "карте выдан инструмент выбора точки"
+
+        plugin._point_picked(QgsPointXY(4614193, 6931373))
+        wait_for_reply()
+        query = last_query()
+        assert "/reverse?" in NominatimStub.requests[-1][1], NominatimStub.requests[-1][1]
+        assert abs(float(query["lat"][0]) - 52.72) < 0.01 and abs(float(query["lon"][0]) - 41.45) < 0.01, query
+        labels = [dialog.results_list.item(i).text() for i in range(dialog.results_list.count())]
+        assert labels == ["7, проспект Энергетиков, Тамбов, 392000, Россия — дом"], labels
+        assert plugin.marker is not None
+        assert abs(iface.canvas.scale() - scale) < 1e-6 and iface.canvas.center() == center, "карта не прыгает"
+
+        dialog.add_point_button.click()
+        layer = QgsProject.instance().mapLayersByName("Найденные адреса")[0]
+        feature = sorted(layer.getFeatures(), key=lambda f: f["source"])[-1]
+        assert feature["source"] == "OpenStreetMap", feature["source"]
+        assert (feature["street"], feature["house"], feature["city"], feature["postcode"]) == (
+            "проспект Энергетиков", "7", "Тамбов", "392000"), feature.attributes()
+        assert feature["oktmo"] is None or feature["oktmo"] == NULL, "у OSM кодов нет"
+
+        dialog.pick_button.setChecked(False)
+        assert iface.canvas.mapTool() is not plugin.map_tool, "инструмент отпускается"
+    finally:
+        server.shutdown()
+        dialog.set_provider("dadata")
+
+
+def test_reverse_answer_without_address():
+    from GeoSearchRU.providers import Nominatim
+    assert Nominatim().parse('{"error": "Unable to geocode"}') == []
+    QSettings().remove("GeoSearchRU/nominatim_url")  # предыдущая проверка оставила тестовый сервер
+    assert Nominatim().url("reverse") == "https://nominatim.openstreetmap.org/reverse"
+    QSettings().setValue("GeoSearchRU/nominatim_url", "https://nominatim.example.ru/search")
+    assert Nominatim().url("reverse") == "https://nominatim.example.ru/reverse"
+
+
+def test_dadata_reverse_request():
+    from GeoSearchRU.providers import Dadata
+    request, body = Dadata().reverse(52.72, 41.45, "TOKEN", 10)
+    assert request.url().toString().endswith("/rs/geolocate/address"), request.url().toString()
+    payload = json.loads(body)
+    assert payload == {"lat": 52.72, "lon": 41.45, "count": 10, "radius_meters": 1000}, payload
+    assert bytes(request.rawHeader(b"Authorization")) == b"Token TOKEN"
 
 
 def test_keys_not_stored_when_unticked():
@@ -540,6 +656,37 @@ def test_yandex_request_and_signature():
     assert signature == expected, (signature, expected)
     plain = Yandex.signature(path, secret, "plain")
     assert plain == base64.urlsafe_b64encode(hmac.new(b"0123456789abcdef", path.encode(), hashlib.sha256).digest()).decode()
+
+
+def test_yandex_map_frame_and_reverse():
+    from urllib.parse import unquote
+    from GeoSearchRU.providers import Yandex
+
+    request, _ = Yandex().request("Энергетиков 7", "KEY", 10, bbox=(41.43, 52.70, 41.45, 52.71))
+    query = unquote(bytes(request.url().toEncoded()).decode())
+    assert "bbox=41.430000,52.700000~41.450000,52.710000" in query, query
+    assert "rspn=1" in query and query.endswith("&apikey=KEY"), query
+
+    request, body = Yandex().reverse(52.72, 41.45, "KEY", 10)
+    query = unquote(bytes(request.url().toEncoded()).decode())
+    assert body is None and "geocode=41.450000,52.720000" in query, query
+
+
+def test_yandex_address_parts():
+    from GeoSearchRU.providers import Yandex
+    answer = json.loads(json.dumps(YANDEX_ANSWER))
+    block = answer["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]
+    block["metaDataProperty"]["GeocoderMetaData"]["Address"]["Components"] = [
+        {"kind": "country", "name": "Россия"},
+        {"kind": "province", "name": "Центральный федеральный округ"},
+        {"kind": "province", "name": "Тамбовская область"},
+        {"kind": "locality", "name": "Тамбов"},
+        {"kind": "street", "name": "проспект Энергетиков"},
+        {"kind": "house", "name": "7"},
+    ]
+    parts = Yandex().parse(json.dumps(answer))[0].parts
+    assert parts == {"postcode": "392000", "region": "Тамбовская область", "city": "Тамбов",
+                     "street": "проспект Энергетиков", "house": "7"}, parts
 
 
 def test_unload_aborts_request_silently():
