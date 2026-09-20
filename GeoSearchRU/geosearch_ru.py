@@ -18,6 +18,7 @@ except ImportError:
 from . import altan_toolbar
 from .geosearch_ru_dialog import GeoSearchDialog
 from .keys_dialog import KeysDialog
+from .overpass import Overpass
 from .providers import Dadata, Nominatim, PART_FIELDS, Yandex
 
 POINTS_LAYER_NAME = "Найденные адреса"
@@ -44,11 +45,13 @@ class GeoSearchRU:
         self.iface, self.action, self.dialog = iface, None, None
         self.marker = self.marker_wgs84 = self.reply = None
         self.reply_key = None  # (provider id, normalised query) of the request in flight
-        self.map_tool = None  # «адрес по точке на карте»
+        self.map_tool = None  # «адрес по точке на карте» и «что здесь?»
+        self.click_mode = "address"
         self.keep_view = False  # a reverse search leaves the map where the user clicked
         self.results = []
         self.points_layer_id = None
-        self.providers = {p.ID: p for p in (Dadata(), Yandex(), Nominatim())}
+        # Overpass отвечает на «Что здесь?»; в списке источников поиска адреса его нет.
+        self.providers = {p.ID: p for p in (Dadata(), Yandex(), Nominatim(), Overpass())}
         self.credentials = {}  # provider id → [key, secret]
         self.keys_dialog = None
         self.check_reply = None
@@ -95,7 +98,8 @@ class GeoSearchRU:
 
     def show_dialog(self):
         if self.dialog is None:
-            self.dialog = GeoSearchDialog([(p.ID, p.TITLE) for p in self.providers.values()], self.iface.mainWindow())
+            searchable = [(p.ID, p.TITLE) for p in self.providers.values() if p.SEARCHABLE]
+            self.dialog = GeoSearchDialog(searchable, self.iface.mainWindow())
             settings = QSettings()
             for provider in self.providers.values():
                 self.credentials[provider.ID] = [
@@ -111,7 +115,8 @@ class GeoSearchRU:
             self.dialog.results_list.currentRowChanged.connect(self.show_result)
             self.dialog.clear_button.clicked.connect(self.clear_result)
             self.dialog.add_point_button.clicked.connect(self.add_point)
-            self.dialog.pick_button.toggled.connect(self.pick_point)
+            self.dialog.pick_button.toggled.connect(lambda on: self.set_click_mode("address", on))
+            self.dialog.info_button.toggled.connect(lambda on: self.set_click_mode("info", on))
             self.dialog.bounded.setChecked(settings.value(self.SETTINGS_BOUNDED, False, type=bool))
             self.dialog.bounded.toggled.connect(
                 lambda checked: QSettings().setValue(self.SETTINGS_BOUNDED, checked))
@@ -127,7 +132,8 @@ class GeoSearchRU:
 
     def _update_titles(self):
         self.dialog.set_provider_titles({
-            p.ID: p.TITLE if self._has_key(p) else f"{p.TITLE} — нет ключа" for p in self.providers.values()
+            p.ID: p.TITLE if self._has_key(p) else f"{p.TITLE} — нет ключа"
+            for p in self.providers.values() if p.SEARCHABLE
         })
 
     def _provider_changed(self):
@@ -173,7 +179,7 @@ class GeoSearchRU:
         self.pending = None
         token, secret = self.credentials.get(provider.ID, ["", ""])
         request, body = build(token, secret)
-        request.setTransferTimeout(self.TIMEOUT_MS)
+        request.setTransferTimeout(getattr(provider, "TIMEOUT_MS", self.TIMEOUT_MS))
         timer = QElapsedTimer()
         timer.start()
         self.last_request[provider.ID] = timer
@@ -207,13 +213,19 @@ class GeoSearchRU:
 
     def _show_results(self, provider, results, key=None):
         self.results = [(provider, result) for result in results]
+        self.dialog.show_attribution(provider)
         if not self.results:
             self.dialog.set_status(self._nothing_found(key), "error")
             return
-        self.dialog.set_results([f"{r.address} — {r.precision}" for r in results])
+        # Для объектов OSM вид уже стоит в начале строки — во второй раз его не повторяем.
+        self.dialog.set_results([
+            r.address if r.precision.lower() in r.address.lower() else f"{r.address} — {r.precision}"
+            for r in results])
 
     @staticmethod
     def _nothing_found(key):
+        if key and str(key[1]).startswith("info:"):
+            return "В этой точке в OpenStreetMap ничего не нарисовано. Щёлкните по зданию или дороге."
         if key and str(key[1]).startswith("reverse:"):
             return "В этой точке адрес не найден. Щёлкните ближе к дому или улице."
         if key and len(key) > 2 and key[2]:
@@ -226,21 +238,35 @@ class GeoSearchRU:
         provider, result = self.results[row]
         keep_view, self.keep_view = self.keep_view, False
         self.dialog.add_point_button.setEnabled(result.latitude is not None)
+        self.dialog.normalized_address.setPlainText(self._card(provider, result))
         if result.latitude is None:
             self._clear_marker()
-            self.dialog.normalized_address.setPlainText(f"{result.address}\n\nКоординаты не определены.")
             self.dialog.set_status("У этого варианта нет координат.", "error")
             return
-        self.dialog.normalized_address.setPlainText(
-            f"{result.address}\n\nКоординаты WGS 84:\nШирота: {result.latitude:.6f}\n"
-            f"Долгота: {result.longitude:.6f}\nТочность: {result.precision}\nИсточник: {provider.SOURCE}"
-        )
         if not self.center_and_mark(result.longitude, result.latitude, result.scale, recenter=not keep_view):
             self.dialog.set_status("Не удалось пересчитать координаты в систему координат проекта.", "error")
+        elif not provider.COARSE_WARNING:
+            self.dialog.set_status(f"Объект OpenStreetMap: {result.precision}.")
         elif result.coarse:
             self.dialog.set_status(f"Координаты приблизительные ({result.precision}). Уточните адрес.", "warning")
         else:
             self.dialog.set_status("Адрес и координаты найдены.")
+
+    @staticmethod
+    def _card(provider, result):
+        """Карточка под списком: адрес, координаты, разбор адреса и сведения об объекте."""
+        lines = [result.address, ""]
+        if result.latitude is None:
+            lines.append("Координаты не определены.")
+        else:
+            lines += ["Координаты WGS 84:", f"Широта: {result.latitude:.6f}", f"Долгота: {result.longitude:.6f}"]
+        lines += [f"Точность: {result.precision}", f"Источник: {provider.SOURCE}"]
+        parts = [f"{POINTS_FIELD_ALIASES[name]}: {value}" for name, value in (result.parts or {}).items()]
+        if parts:
+            lines += ["", "Разбор адреса:"] + parts
+        if result.details:
+            lines += ["", "Сведения:", result.details]
+        return "\n".join(lines)
 
     def add_point(self):
         row = self.dialog.results_list.currentRow()
@@ -306,34 +332,42 @@ class GeoSearchRU:
         self.marker.setPenWidth(3)
         return True
 
-    def pick_point(self, enabled):
-        """«Адрес по точке на карте»: hand the canvas a click tool and search by the point clicked."""
+    def set_click_mode(self, mode, enabled):
+        """Два режима щелчка по карте: «address» — адрес по точке, «info» — что здесь есть."""
         canvas = self.iface.mapCanvas()
         if not enabled:
-            if self.map_tool is not None and canvas.mapTool() is self.map_tool:
+            if self.click_mode == mode and self.map_tool is not None and canvas.mapTool() is self.map_tool:
                 canvas.unsetMapTool(self.map_tool)
             return
+        self.click_mode = mode
+        other = self.dialog.info_button if mode == "address" else self.dialog.pick_button
+        other.setChecked(False)  # режимы взаимоисключающие
         if self.map_tool is None:
             self.map_tool = QgsMapToolEmitPoint(canvas)
             self.map_tool.canvasClicked.connect(self._point_picked)
             # The user can switch to another tool on the toolbar: the button has to follow.
             self.map_tool.deactivated.connect(self._tool_deactivated)
         canvas.setMapTool(self.map_tool)
-        self.dialog.set_status(f"Щёлкните по карте — {self.provider().SOURCE} найдёт ближайший адрес.")
+        if mode == "info":
+            self.dialog.set_status("Щёлкните по карте — модуль покажет, что здесь есть в OpenStreetMap.")
+        else:
+            self.dialog.set_status(f"Щёлкните по карте — {self.provider().SOURCE} найдёт ближайший адрес.")
 
     def _tool_deactivated(self):
         if self.dialog:
             self.dialog.pick_button.setChecked(False)
+            self.dialog.info_button.setChecked(False)
 
     def _point_picked(self, point, _button=None):
         wgs84 = self._to_wgs84(point)
         if wgs84 is None:
             self.dialog.set_status("Не удалось пересчитать точку в WGS 84.", "error")
             return
-        provider = self.provider()
+        info = self.click_mode == "info"
+        provider = self.providers[Overpass.ID] if info else self.provider()
         latitude, longitude = round(wgs84.y(), 6), round(wgs84.x(), 6)
-        key = (provider.ID, f"reverse:{latitude},{longitude}")
-        self.keep_view = True  # the user is looking at the place already
+        key = (provider.ID, f"{'info' if info else 'reverse'}:{latitude},{longitude}")
+        self.keep_view = True  # пользователь и так смотрит на это место
         self._start(provider, key,
                     lambda token, secret: provider.reverse(latitude, longitude, token, self.RESULT_COUNT, secret))
 

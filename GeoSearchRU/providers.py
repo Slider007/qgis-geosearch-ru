@@ -21,8 +21,9 @@ from qgis.PyQt.QtNetwork import QNetworkRequest
 PLUGIN_URL = "https://github.com/Slider007/qgis-geosearch-ru"
 
 # precision: text for the user; coarse: coordinates are not at house level; scale: map scale to zoom to;
-# parts: the address split into fields (see PART_FIELDS), as far as the service reports them.
-Result = namedtuple("Result", "address latitude longitude precision coarse scale parts")
+# parts: the address split into fields (see PART_FIELDS), as far as the service reports them;
+# details: extra lines about the object, shown in the card under the list («Что здесь?»).
+Result = namedtuple("Result", "address latitude longitude precision coarse scale parts details")
 
 NO_COORDINATES = "без координат"
 
@@ -35,12 +36,12 @@ def _parts(**values):
     return {name: str(values[name]).strip() for name in PART_FIELDS if values.get(name)}
 
 
-def _result(address, latitude, longitude, precision, coarse, scale, parts=None):
+def _result(address, latitude, longitude, precision, coarse, scale, parts=None, details=""):
     try:
         latitude, longitude = float(latitude), float(longitude)
     except (TypeError, ValueError):
-        return Result(address, None, None, NO_COORDINATES, True, None, parts or {})
-    return Result(address, latitude, longitude, precision, coarse, scale, parts or {})
+        return Result(address, None, None, NO_COORDINATES, True, None, parts or {}, details)
+    return Result(address, latitude, longitude, precision, coarse, scale, parts or {}, details)
 
 
 def _json_message(body):
@@ -62,6 +63,8 @@ class Dadata:
     SOURCE = "DaData"
     NEEDS_TOKEN = True
     NEEDS_SECRET = False
+    SEARCHABLE = True  # источник поиска адреса, показывается в списке
+    COARSE_WARNING = True
     TOKEN_LABEL = "Токен DaData"
     TOKEN_URL = "https://dadata.ru/profile/#info"
     TOKEN_HINT = "Открыть личный кабинет DaData: после регистрации там будет API-ключ"
@@ -148,6 +151,8 @@ class Nominatim:
     SOURCE = "OpenStreetMap"
     NEEDS_TOKEN = False
     NEEDS_SECRET = False
+    SEARCHABLE = True  # источник поиска адреса, показывается в списке
+    COARSE_WARNING = True
     SETTINGS_TOKEN = SETTINGS_SECRET = None
     ATTRIBUTION = (
         'Данные © <a href="https://www.openstreetmap.org/copyright">участники OpenStreetMap</a>, лицензия ODbL. '
@@ -258,6 +263,8 @@ class Yandex:
     SOURCE = "Яндекс"
     NEEDS_TOKEN = True
     NEEDS_SECRET = True
+    SEARCHABLE = True  # источник поиска адреса, показывается в списке
+    COARSE_WARNING = True
     TOKEN_LABEL = "Ключ Яндекса"
     TOKEN_URL = "https://developer.tech.yandex.ru/"
     TOKEN_HINT = "Открыть Кабинет разработчика Яндекса: ключ пакета «API Геокодера» и секрет подписи"

@@ -36,6 +36,12 @@ class GeoSearchDialog(QDialog):
         self.pick_button.setCheckable(True)
         self.pick_button.setAutoDefault(False)
         self.pick_button.setToolTip("Щёлкнуть по карте и получить ближайший адрес")
+        self.info_button = QPushButton("Что здесь?")
+        self.info_button.setCheckable(True)
+        self.info_button.setAutoDefault(False)
+        self.info_button.setToolTip(
+            "Щёлкнуть по карте и увидеть объекты OpenStreetMap в этой точке: "
+            "здание, участок, дорогу, ЛЭП, а также границы, внутри которых точка лежит")
         self.results_label = QLabel()
         self.results_list = QListWidget()
         self.results_list.setMinimumHeight(110)
@@ -61,6 +67,7 @@ class GeoSearchDialog(QDialog):
         search_row.addWidget(self.search_button)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.addButton(self.pick_button, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.addButton(self.info_button, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.addButton(self.clear_button, QDialogButtonBox.ButtonRole.ResetRole)
         buttons.addButton(self.add_point_button, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.rejected.connect(self.reject)
@@ -89,10 +96,13 @@ class GeoSearchDialog(QDialog):
             if title:
                 self.provider_combo.setItemText(index, title)
 
-    def show_provider(self, provider):
-        """Show the attribution the provider needs and whether it can search inside the map frame."""
+    def show_attribution(self, provider):
         self.attribution_label.setText(provider.ATTRIBUTION or "")
         self.attribution_label.setVisible(bool(provider.ATTRIBUTION))
+
+    def show_provider(self, provider):
+        """Show the attribution the provider needs and whether it can search inside the map frame."""
+        self.show_attribution(provider)
         self.bounded.setEnabled(provider.SUPPORTS_BBOX)
         self.bounded.setToolTip(
             "Искать адрес только внутри того, что видно на карте"
@@ -115,7 +125,7 @@ class GeoSearchDialog(QDialog):
 
     def set_busy(self, busy):
         for widget in (self.search_button, self.address_edit, self.provider_combo, self.keys_button,
-                       self.pick_button):
+                       self.pick_button, self.info_button):
             widget.setEnabled(not busy)
         self.status_label.setText("Идет поиск…" if busy else "")
 

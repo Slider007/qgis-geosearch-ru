@@ -486,6 +486,105 @@ def test_address_by_map_click():
         dialog.set_provider("dadata")
 
 
+OVERPASS_ANSWER = {"elements": [
+    {"type": "node", "id": 1, "lat": 52.7201, "lon": 41.4502},  # вершина линии, без тегов
+    {"type": "node", "id": 2, "lat": 52.7202, "lon": 41.4503, "tags": {"name": "Спутник", "shop": "travel_agency"}},
+    {"type": "way", "id": 3, "center": {"lat": 52.72005, "lon": 41.45005},
+     "tags": {"building": "commercial", "building:levels": "1", "addr:street": "Интернациональная улица",
+              "addr:housenumber": "30Г", "addr:city": "Тамбов", "addr:postcode": "392033"}},
+    {"type": "way", "id": 4, "center": {"lat": 52.7203, "lon": 41.4499},
+     "tags": {"power": "line", "voltage": "110000", "cables": "3", "operator": "Россети"}},
+    {"type": "way", "id": 5, "center": {"lat": 52.7199, "lon": 41.4505},
+     "tags": {"highway": "service", "surface": "asphalt"}},
+    {"type": "area", "id": 6, "tags": {"boundary": "administrative", "admin_level": "8", "name": "Тамбов"}},
+    {"type": "area", "id": 7, "tags": {"boundary": "administrative", "admin_level": "4",
+                                       "name": "Тамбовская область"}},
+    {"type": "area", "id": 8, "tags": {"boundary": "economic", "name": "Центрально-Чернозёмный район"}},
+]}
+
+
+class OverpassStub(BaseHTTPRequestHandler):
+    bodies = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        OverpassStub.bodies.append((self.rfile.read(length).decode(), dict(self.headers)))
+        body = json.dumps(OVERPASS_ANSWER).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_what_is_here():
+    from urllib.parse import unquote
+    server = HTTPServer(("127.0.0.1", 0), OverpassStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    QSettings().setValue("GeoSearchRU/overpass_url", f"http://127.0.0.1:{server.server_port}/api/interpreter")
+    OverpassStub.bodies = []
+    try:
+        dialog.set_provider("dadata")  # источник поиска роли не играет
+        dialog.info_button.setChecked(True)
+        assert plugin.click_mode == "info" and iface.canvas.mapTool() is plugin.map_tool
+        dialog.pick_button.setChecked(True)
+        assert not dialog.info_button.isChecked() and plugin.click_mode == "address", "режимы взаимоисключающие"
+        dialog.info_button.setChecked(True)
+
+        iface.canvas.setExtent(QgsRectangle(4613000, 6930000, 4615000, 6932000))
+        scale = iface.canvas.scale()
+        plugin._point_picked(QgsPointXY(4614193, 6931373))
+        wait_for_reply()
+
+        query, headers = OverpassStub.bodies[-1]
+        query = unquote(query[len("data="):])
+        assert query.startswith("[out:json][timeout:25];is_in(52.7") and query.endswith("out tags center 60;"), query
+        assert "way(around:30,52.7" in query and "node(around:30,52.7" in query, query
+        assert headers.get("Referer") == "https://github.com/Slider007/qgis-geosearch-ru"
+
+        labels = [dialog.results_list.item(i).text() for i in range(dialog.results_list.count())]
+        assert labels == [
+            "Здание: коммерческое, Интернациональная улица, 30Г",
+            "Электросети: ЛЭП",
+            "Дорога: проезд",
+            "Магазин: турагентство, «Спутник»",
+            "Граница: город или поселение, «Тамбов»",
+            "Граница: субъект, «Тамбовская область»",
+        ], labels
+        assert "экономический" not in " ".join(labels), "лишние площади из is_in отброшены"
+        assert abs(iface.canvas.scale() - scale) < 1e-6, "карта не прыгает"
+        assert not dialog.attribution_label.isHidden() and "OpenStreetMap" in dialog.attribution_label.text()
+
+        card = dialog.normalized_address.toPlainText()
+        assert "Этажей: 1" in card and "Индекс: 392033" in card and "Улица: Интернациональная улица" in card, card
+        dialog.results_list.setCurrentRow(1)
+        card = dialog.normalized_address.toPlainText()
+        assert "Напряжение, В: 110000" in card and "Обслуживает: Россети" in card, card
+        assert "power=line" not in card, "вид объекта не повторяется тегом"
+        assert "Объект OpenStreetMap" in dialog.status_label.text(), dialog.status_label.text()
+
+        dialog.results_list.setCurrentRow(0)
+        dialog.add_point_button.click()
+        layer = QgsProject.instance().mapLayersByName("Найденные адреса")[0]
+        feature = sorted(layer.getFeatures(), key=lambda f: f.id())[-1]
+        assert (feature["house"], feature["postcode"]) == ("30Г", "392033"), feature.attributes()
+
+        dialog.info_button.setChecked(False)
+        assert iface.canvas.mapTool() is not plugin.map_tool
+    finally:
+        server.shutdown()
+
+
+def test_what_is_here_empty_and_busy():
+    from GeoSearchRU.overpass import Overpass
+    assert Overpass().parse('{"elements": []}') == []
+    assert Overpass().error_detail('{"remark": "runtime error: Query timed out"}') == "runtime error: Query timed out"
+    assert plugin._nothing_found(("overpass", "info:52.72,41.45")).startswith("В этой точке в OpenStreetMap")
+
+
 def test_reverse_answer_without_address():
     from GeoSearchRU.providers import Nominatim
     assert Nominatim().parse('{"error": "Unable to geocode"}') == []
