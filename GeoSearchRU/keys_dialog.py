@@ -6,7 +6,7 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
 )
 
-STATUS_COLOURS = {"ok": "#2e7d32", "warning": "#e65100", "error": "#b71c1c"}
+from .geosearch_ru_dialog import status_colour
 
 
 class ProviderKeys:
@@ -45,7 +45,8 @@ class ProviderKeys:
         return self.token_edit.text().strip(), self.secret_edit.text().strip()
 
     def set_status(self, message, level="ok"):
-        colour = STATUS_COLOURS[level]
+        # ProviderKeys — не виджет, палитру берём у самой подписи.
+        colour = status_colour(self.status_label, level)
         self.status_label.setText(f'<span style="color:{colour};">{html.escape(message)}</span>')
 
 
@@ -56,7 +57,8 @@ class KeysDialog(QDialog):
         """providers: providers that need a key; credentials: {provider id: [token, secret]}."""
         super().__init__(parent)
         self.setWindowTitle("Поиск адреса — ключи")
-        self.setMinimumWidth(520)
+        # См. окно поиска: ширина в долях шрифта, иначе подписи обрезаются при крупном шрифте.
+        self.setMinimumWidth(self.fontMetrics().horizontalAdvance("0") * 66)
         layout = QVBoxLayout(self)
         intro = QLabel("Впишите ключи сервисов и нажмите «Проверить» — модуль сделает один пробный запрос. "
                        "OpenStreetMap работает без ключа.")
@@ -71,7 +73,10 @@ class KeysDialog(QDialog):
             section.check_button.clicked.connect(lambda _=False, pid=provider.ID: self.check_requested.emit(pid))
             layout.addWidget(section.box)
             self.sections[provider.ID] = section
-        self.remember = QCheckBox("Хранить ключи на этом компьютере (в настройках QGIS, открытым текстом)")
+        self.remember = QCheckBox("Хранить ключи на этом компьютере")
+        self.remember.setToolTip(
+            "Ключи сохранятся в настройках профиля QGIS открытым текстом.\n"
+            "На общем компьютере галочку лучше снять: тогда ключи действуют до закрытия QGIS.")
         self.remember.setChecked(remember)
         layout.addWidget(self.remember)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)

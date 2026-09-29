@@ -1,13 +1,13 @@
 import os
 
 from qgis.core import (
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsFeature, QgsGeometry,
-    QgsMarkerSymbol, QgsNetworkAccessManager, QgsPointXY, QgsProject, QgsVectorLayer,
+    Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsFeature, QgsFillSymbol,
+    QgsGeometry, QgsMarkerSymbol, QgsNetworkAccessManager, QgsPointXY, QgsProject, QgsVectorLayer,
 )
 from qgis.gui import QgsMapToolEmitPoint, QgsVertexMarker
 from qgis.PyQt.QtCore import QElapsedTimer, QSettings, QTimer
-from qgis.PyQt.QtGui import QColor, QIcon
-from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
+from qgis.PyQt.QtGui import QColor, QIcon, QTextCursor
+from qgis.PyQt.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from qgis.PyQt.QtWidgets import QDialog
 
 try:
@@ -18,6 +18,7 @@ except ImportError:
 from . import altan_toolbar
 from .geosearch_ru_dialog import GeoSearchDialog
 from .keys_dialog import KeysDialog
+from .nspd import FIELD_LABELS, FIELD_NAMES, NUMERIC_FIELDS, Nspd, is_cadastral_number, normalize_number
 from .overpass import Overpass
 from .providers import Dadata, Nominatim, PART_FIELDS, Yandex
 
@@ -31,6 +32,13 @@ POINTS_FIELD_ALIASES = {
     "postcode": "Индекс", "region": "Регион", "area": "Район", "city": "Город или населённый пункт",
     "street": "Улица", "house": "Дом", "fias": "Код ФИАС", "oktmo": "ОКТМО", "okato": "ОКАТО",
 }
+
+CADASTRE_LAYER_NAME = "Кадастровые объекты"
+CADASTRE_LAYER_URI = (
+    "Polygon?crs=EPSG:4326&field=kind:string&field=source:string"
+    + "".join(f"&field={name}:{'double' if name in NUMERIC_FIELDS else 'string'}" for name in FIELD_NAMES)
+)
+CADASTRE_FIELD_ALIASES = dict(FIELD_LABELS, kind="Тип объекта", source="Источник")
 
 
 class GeoSearchRU:
@@ -46,13 +54,18 @@ class GeoSearchRU:
         self.iface, self.action, self.dialog = iface, None, None
         self.marker = self.marker_wgs84 = self.reply = None
         self.reply_key = None  # (provider id, normalised query) of the request in flight
+        self.ssl_problems = []  # претензии к сертификату сервера по текущему запросу
+        self.current = None  # (провайдер, ключ, build) последнего запроса — для повтора
+        self.attempt = 1
         self.map_tool = None  # «адрес по точке на карте» и «что здесь?»
         self.click_mode = "address"
         self.keep_view = False  # a reverse search leaves the map where the user clicked
         self.results = []
         self.points_layer_id = None
+        self.cadastre_layer_ids = {}  # вид геометрии → id временного слоя с объектами ЕГРН
+        self.own_manager = None  # для НСПД: там нужен свой User-Agent, см. _manager
         # Overpass отвечает на «Что здесь?»; в списке источников поиска адреса его нет.
-        self.providers = {p.ID: p for p in (Dadata(), Yandex(), Nominatim(), Overpass())}
+        self.providers = {p.ID: p for p in (Dadata(), Yandex(), Nominatim(), Overpass(), Nspd())}
         self.credentials = {}  # provider id → [key, secret]
         self.keys_dialog = None
         self.check_reply = None
@@ -87,6 +100,9 @@ class GeoSearchRU:
             self.map_tool.deleteLater()
             self.map_tool = None
         self._clear_marker()
+        if self.own_manager is not None:
+            self.own_manager.deleteLater()
+            self.own_manager = None
         if self.dialog:
             self.dialog.close()
             self.dialog.deleteLater()
@@ -113,6 +129,7 @@ class GeoSearchRU:
             self._provider_changed()
             self.dialog.keys_button.clicked.connect(lambda: self.open_keys(self.provider().ID))
             self.dialog.search_button.clicked.connect(self.search)
+            self.dialog.cadastral_button.clicked.connect(self.search_cadastral)
             self.dialog.results_list.currentRowChanged.connect(self.show_result)
             self.dialog.clear_button.clicked.connect(self.clear_result)
             self.dialog.add_point_button.clicked.connect(self.add_point)
@@ -122,9 +139,10 @@ class GeoSearchRU:
                 # Пишется в настройки, чтобы ключ был виден в «Параметры → Дополнительно».
                 settings.setValue(self.SETTINGS_INFO, False)
             self.dialog.show_info_button(settings.value(self.SETTINGS_INFO, False, type=bool))
-            self.dialog.bounded.setChecked(settings.value(self.SETTINGS_BOUNDED, False, type=bool))
-            self.dialog.bounded.toggled.connect(
-                lambda checked: QSettings().setValue(self.SETTINGS_BOUNDED, checked))
+            remembered = settings.value(self.SETTINGS_BOUNDED, False, type=bool)
+            self.dialog.remembered_bounded = remembered
+            self.dialog.bounded.setChecked(remembered)
+            self.dialog.bounded.toggled.connect(self._bounded_toggled)
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
@@ -141,21 +159,46 @@ class GeoSearchRU:
             for p in self.providers.values() if p.SEARCHABLE
         })
 
+    def _bounded_toggled(self, checked):
+        self.dialog.remembered_bounded = checked
+        QSettings().setValue(self.SETTINGS_BOUNDED, checked)
+
     def _provider_changed(self):
         provider = self.provider()
         QSettings().setValue(self.SETTINGS_PROVIDER, provider.ID)
         self.dialog.show_provider(provider)
 
     def search(self):
-        provider = self.provider()
         address = self.dialog.address_edit.text().strip()
         if not address:
             self.dialog.set_status("Введите адрес.", "error")
             return
+        if is_cadastral_number(address):
+            # Номер, набранный в поле адреса, тоже ищется в ЕГРН — чтобы не гадать, куда его вписывать.
+            self.dialog.cadastral_edit.setText(address)
+            self.search_cadastral()
+            return
+        provider = self.provider()
         bbox = self._map_bbox() if self.dialog.bounded.isChecked() and provider.SUPPORTS_BBOX else None
         key = (provider.ID, " ".join(address.lower().split()), bbox)
         self._start(provider, key,
                     lambda token, secret: provider.request(address, token, self.RESULT_COUNT, secret, None, bbox))
+
+    def search_cadastral(self):
+        """Кадастровый номер ищется в НСПД, какой бы источник ни был выбран."""
+        text = self.dialog.cadastral_edit.text().strip()
+        if not text:
+            self.dialog.set_status("Введите кадастровый номер, например 68:29:0309001:24.", "error")
+            return
+        if not is_cadastral_number(text):
+            self.dialog.set_status(
+                "Это не похоже на кадастровый номер. Формат — 68:29:0309001:24 "
+                "(можно и номер квартала: 68:29:0309001).", "error")
+            return
+        provider = self.providers[Nspd.ID]
+        number = normalize_number(text)
+        self._start(provider, (provider.ID, f"cadastral:{number}", None),
+                    lambda token, secret: provider.request(number))
 
     def _start(self, provider, key, build):
         """Run one request, respecting the provider's minimum interval and the answer cache."""
@@ -169,6 +212,7 @@ class GeoSearchRU:
             self._show_results(provider, self.cache[key], key)
             return
         self.dialog.set_busy(True)
+        self.attempt = 1
         self.pending = (provider, key, build)
         timer = self.last_request.get(provider.ID)
         wait = provider.MIN_INTERVAL_MS - timer.elapsed() if timer else 0
@@ -182,17 +226,61 @@ class GeoSearchRU:
             return
         provider, key, build = self.pending
         self.pending = None
+        self.current = (provider, key, build)
         token, secret = self.credentials.get(provider.ID, ["", ""])
         request, body = build(token, secret)
         request.setTransferTimeout(getattr(provider, "TIMEOUT_MS", self.TIMEOUT_MS))
         timer = QElapsedTimer()
         timer.start()
         self.last_request[provider.ID] = timer
-        # QGIS network manager honours the proxy and SSL settings configured in QGIS.
-        manager = QgsNetworkAccessManager.instance()
+        manager = self._manager(provider)
         self.reply_key = key
+        self.ssl_problems = []
         self.reply = manager.get(request) if body is None else manager.post(request, body)
+        # Qt сообщает SslHandshakeFailedError и когда сертификат не принят, и когда сервер
+        # просто оборвал рукопожатие. Различить можно только по этому сигналу.
+        self.reply.sslErrors.connect(self._ssl_errors)
         self.reply.finished.connect(self.handle_response)
+
+    def _retry(self, provider, status):
+        """Временный отказ службы — повторить, а не сдаваться.
+
+        У НСПД защита от всплесков отвечает 597 и 429 и следом пропускает тот же
+        запрос: одна попытка ничего не доказывает.
+        """
+        statuses = getattr(provider, "RETRY_STATUSES", ())
+        attempts = getattr(provider, "MAX_ATTEMPTS", 1)
+        if status is None or int(status) not in statuses or self.attempt >= attempts:
+            return False
+        if self.current is None:
+            return False
+        self.attempt += 1
+        self.dialog.set_busy(True)
+        self.dialog.set_status(
+            f"{provider.SOURCE} отклонил запрос, пробую ещё раз "
+            f"({self.attempt} из {attempts})…", "warning")
+        self.pending = self.current
+        self.throttle.start(getattr(provider, "RETRY_DELAY_MS", 3000))
+        return True
+
+    def _ssl_errors(self, errors):
+        self.ssl_problems = [error.errorString() for error in errors]
+
+    def _manager(self, provider):
+        """Через какой сетевой менеджер слать запрос.
+
+        Обычно — QGIS: он знает прокси и настройки SSL из параметров QGIS.
+        Но QgsNetworkAccessManager подменяет User-Agent своим («Mozilla/5.0 QGIS/…»),
+        а защита НСПД пропускает только браузерный. Поэтому у НСПД свой менеджер,
+        на который переносится прокси QGIS — за прокси модуль тоже должен работать.
+        """
+        if not getattr(provider, "OWN_NETWORK", False):
+            # QGIS network manager honours the proxy and SSL settings configured in QGIS.
+            return QgsNetworkAccessManager.instance()
+        if self.own_manager is None:
+            self.own_manager = QNetworkAccessManager()
+            self.own_manager.setProxy(QgsNetworkAccessManager.instance().proxy())
+        return self.own_manager
 
     def handle_response(self):
         reply, self.reply = self.reply, None
@@ -204,6 +292,9 @@ class GeoSearchRU:
         try:
             body = bytes(reply.readAll()).decode("utf-8", errors="replace")
             if reply.error() != QNetworkReply.NetworkError.NoError:
+                status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                if self._retry(provider, status):
+                    return
                 self.dialog.set_status(self._error_message(provider, reply, body), "error")
                 return
         finally:
@@ -231,6 +322,9 @@ class GeoSearchRU:
     def _nothing_found(key):
         if key and str(key[1]).startswith("info:"):
             return "В этой точке в OpenStreetMap ничего не нарисовано. Щёлкните по зданию или дороге."
+        if key and str(key[1]).startswith("cadastral:"):
+            number = str(key[1]).split(":", 1)[1]
+            return f"В ЕГРН нет объекта с номером {number}. Проверьте номер."
         if key and str(key[1]).startswith("reverse:"):
             return "В этой точке адрес не найден. Щёлкните ближе к дому или улице."
         if key and len(key) > 2 and key[2]:
@@ -243,13 +337,20 @@ class GeoSearchRU:
         provider, result = self.results[row]
         keep_view, self.keep_view = self.keep_view, False
         self.dialog.add_point_button.setEnabled(result.latitude is not None)
+        self.dialog.show_add_mode(result.geometry is not None)
         self.dialog.normalized_address.setPlainText(self._card(provider, result))
+        # Без этого карточка остаётся прокрученной с прошлого варианта и первые строки не видны.
+        self.dialog.normalized_address.moveCursor(QTextCursor.MoveOperation.Start)
         if result.latitude is None:
             self._clear_marker()
-            self.dialog.set_status("У этого варианта нет координат.", "error")
+            self.dialog.set_status(
+                "Объект в ЕГРН есть, но границы не внесены — показывать на карте нечего."
+                if provider.ID == Nspd.ID else "У этого варианта нет координат.", "error")
             return
         if not self.center_and_mark(result.longitude, result.latitude, result.scale, recenter=not keep_view):
             self.dialog.set_status("Не удалось пересчитать координаты в систему координат проекта.", "error")
+        elif provider.ID == Nspd.ID:
+            self.dialog.set_status("Объект ЕГРН найден, границы показаны на карте.")
         elif not provider.COARSE_WARNING:
             self.dialog.set_status(f"Объект OpenStreetMap: {result.precision}.")
         elif result.coarse:
@@ -280,6 +381,9 @@ class GeoSearchRU:
         provider, result = self.results[row]
         if result.latitude is None:
             return
+        if result.geometry is not None:
+            self._add_shape(provider, result)
+            return
         layer = self._points_layer()
         for feature in layer.getFeatures():
             if (feature["address"], feature["lat"], feature["lon"]) == (result.address, result.latitude, result.longitude):
@@ -297,6 +401,61 @@ class GeoSearchRU:
         layer.updateExtents()
         layer.triggerRepaint()
         self.dialog.set_status(f"Точка добавлена во временный слой «{layer.name()}» (точек: {layer.featureCount()}).")
+
+    def _add_shape(self, provider, result):
+        """Границы объекта ЕГРН во временный слой «Кадастровые объекты»."""
+        wkt, values, kind = result.geometry
+        geometry = QgsGeometry.fromWkt(wkt)  # WKT уже в WGS 84, как и слой
+        if geometry.isNull() or geometry.isEmpty():
+            self.dialog.set_status("Границы объекта не удалось прочитать.", "error")
+            return
+        layer = self._cadastre_layer(geometry.type())
+        number = values.get("cad_num", "")
+        for feature in layer.getFeatures():
+            if number and feature["cad_num"] == number:
+                self.dialog.set_status(f"Этот объект уже есть в слое «{layer.name()}».", "warning")
+                return
+        feature = QgsFeature(layer.fields())
+        for name, value in dict(values, kind=kind, source=provider.SOURCE).items():
+            index = layer.fields().indexOf(name)
+            if index < 0:
+                continue
+            if name in NUMERIC_FIELDS:
+                try:
+                    value = float(str(value).replace(",", ".").replace(" ", ""))
+                except ValueError:
+                    continue
+            feature[name] = value
+        feature.setGeometry(geometry)
+        layer.dataProvider().addFeatures([feature])
+        layer.updateExtents()
+        layer.triggerRepaint()
+        self.dialog.set_status(
+            f"Границы добавлены во временный слой «{layer.name()}» (объектов: {layer.featureCount()}).")
+
+    def _cadastre_layer(self, geometry_type):
+        """Слой объектов ЕГРН. Слоёв два: у ЕГРН есть и площадные объекты, и точечные."""
+        point = geometry_type == Qgis.GeometryType.Point
+        layer_id = self.cadastre_layer_ids.get(point)
+        layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
+        if layer is not None:
+            return layer
+        name = f"{CADASTRE_LAYER_NAME} (точки)" if point else CADASTRE_LAYER_NAME
+        uri = CADASTRE_LAYER_URI.replace("Polygon?", "Point?" if point else "MultiPolygon?", 1)
+        layer = QgsVectorLayer(uri, name, "memory")
+        for field, alias in CADASTRE_FIELD_ALIASES.items():
+            index = layer.fields().indexOf(field)
+            if index >= 0:
+                layer.setFieldAlias(index, alias)
+        if point:
+            layer.renderer().setSymbol(QgsMarkerSymbol.createSimple(
+                {"name": "square", "color": "#1565c0", "outline_color": "#ffffff", "size": "3"}))
+        else:
+            layer.renderer().setSymbol(QgsFillSymbol.createSimple(
+                {"color": "255,193,7,60", "outline_color": "#ff6f00", "outline_width": "0.6"}))
+        QgsProject.instance().addMapLayer(layer)
+        self.cadastre_layer_ids[point] = layer.id()
+        return layer
 
     def _points_layer(self):
         # One scratch layer for all found addresses; recreated if the user removed it.
@@ -520,13 +679,22 @@ class GeoSearchRU:
             reply.abort()
             reply.deleteLater()
 
-    @staticmethod
-    def _error_message(provider, reply, body):
+    def _error_message(self, provider, reply, body):
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         if status is None:
+            if reply.error() == QNetworkReply.NetworkError.SslHandshakeFailedError:
+                if self.ssl_problems:
+                    # Сертификат сервера и правда отвергнут: у НСПД он выдан Минцифры.
+                    return (f"{provider.SOURCE}: сертификат сервера не принят ({self.ssl_problems[0]}). "
+                            "Установите корневой сертификат Минцифры — «Настройки → Параметры → "
+                            "Аутентификация → Центры сертификации».")
+                # Претензий к сертификату не было: сервер оборвал рукопожатие, не показав сертификат.
+                return (f"{provider.SOURCE} разорвал защищённое соединение. "
+                        + (getattr(provider, "TIMEOUT_HINT", "") or "Проверьте подключение."))
             if reply.error() == QNetworkReply.NetworkError.OperationCanceledError:
-                return (f"{provider.SOURCE} не ответил вовремя. "
-                        "Проверьте подключение к интернету и настройки прокси в QGIS.")
+                hint = getattr(provider, "TIMEOUT_HINT", None) or (
+                    "Проверьте подключение к интернету и настройки прокси в QGIS.")
+                return f"{provider.SOURCE} не ответил вовремя. {hint}"
             return f"Сетевая ошибка: {reply.errorString()}"
         message = f"{provider.SOURCE} вернул ошибку {status}: {provider.HTTP_HINTS.get(int(status), reply.errorString())}"
         detail = provider.error_detail(body)

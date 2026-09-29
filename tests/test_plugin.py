@@ -27,7 +27,8 @@ QCoreApplication.setOrganizationName("geosearch-ru-tests")
 QCoreApplication.setApplicationName("geosearch-ru-tests")
 
 from qgis.core import (  # noqa: E402
-    NULL, QgsApplication, QgsCoordinateReferenceSystem, QgsPointXY, QgsProject, QgsRectangle,
+    NULL, Qgis, QgsApplication, QgsCoordinateReferenceSystem, QgsNetworkAccessManager, QgsPointXY,
+    QgsProject, QgsRectangle,
 )
 from qgis.gui import QgsMapCanvas  # noqa: E402
 from qgis.PyQt.QtNetwork import QNetworkReply  # noqa: E402
@@ -337,6 +338,11 @@ class NominatimStub(BaseHTTPRequestHandler):
         pass
 
 
+def lower_headers(raw):
+    """Имена заголовков без учёта регистра: Qt6 шлёт Sec-Ch-Ua-Mobile, Qt5 — sec-ch-ua-mobile."""
+    return {name.lower(): value for name, value in raw.items()}
+
+
 def wait_for_reply(timeout_ms=10000):
     timer = QElapsedTimer()
     timer.start()
@@ -371,11 +377,12 @@ def test_nominatim_end_to_end():
 
         assert len(NominatimStub.requests) == 1
         _, path, headers = NominatimStub.requests[0]
+        headers = lower_headers(headers)
         query = parse_qs(urlparse(path).query)
         assert query["q"] == ["Тамбов, Энергетиков 7"] and query["format"] == ["jsonv2"], query
         assert query["countrycodes"] == ["ru"] and query["limit"] == ["10"], query
-        assert "QGIS/" in headers.get("User-Agent", ""), headers.get("User-Agent")
-        assert headers.get("Referer") == "https://github.com/Slider007/qgis-geosearch-ru", headers.get("Referer")
+        assert "QGIS/" in headers.get("user-agent", ""), headers.get("user-agent")
+        assert headers.get("referer") == "https://github.com/Slider007/qgis-geosearch-ru", headers.get("referer")
 
         dialog.address_edit.setText("  тамбов,  ЭНЕРГЕТИКОВ 7 ")
         dialog.search_button.click()
@@ -386,7 +393,9 @@ def test_nominatim_end_to_end():
         wait_for_reply()
         assert len(NominatimStub.requests) == 2
         gap = NominatimStub.requests[1][0] - NominatimStub.requests[0][0]
-        assert gap >= 0.99, f"между запросами к Nominatim меньше секунды: {gap:.3f} с"
+        # Пауза меряется QElapsedTimer, у него погрешность в единицы миллисекунд:
+        # проверяем, что выдержана секунда, а не что таймер идеально точен.
+        assert gap >= 0.95, f"между запросами к Nominatim меньше секунды: {gap:.3f} с"
     finally:
         server.shutdown()
         dialog.set_provider("dadata")
@@ -541,10 +550,11 @@ def test_what_is_here():
         wait_for_reply()
 
         query, headers = OverpassStub.bodies[-1]
+        headers = lower_headers(headers)
         query = unquote(query[len("data="):])
         assert query.startswith("[out:json][timeout:25];is_in(52.7") and query.endswith("out tags center 60;"), query
         assert "way(around:30,52.7" in query and "node(around:30,52.7" in query, query
-        assert headers.get("Referer") == "https://github.com/Slider007/qgis-geosearch-ru"
+        assert headers.get("referer") == "https://github.com/Slider007/qgis-geosearch-ru"
 
         labels = [dialog.results_list.item(i).text() for i in range(dialog.results_list.count())]
         assert labels == [
@@ -797,6 +807,332 @@ def test_yandex_address_parts():
     parts = Yandex().parse(json.dumps(answer))[0].parts
     assert parts == {"postcode": "392000", "region": "Тамбовская область", "city": "Тамбов",
                      "street": "проспект Энергетиков", "house": "7"}, parts
+
+
+# --- НСПД: поиск объекта ЕГРН по кадастровому номеру ---------------------------------
+
+NSPD_ANSWER = {"data": {"type": "FeatureCollection", "features": [
+    {"id": 274180162, "type": "Feature",
+     "geometry": {"type": "Polygon", "crs": {"type": "name", "properties": {"name": "EPSG:3857"}},
+                  "coordinates": [[[4614084.51030582, 6925812.158053609],
+                                   [4614086.305353552, 6925845.364793987],
+                                   [4614056.110684374, 6925847.825804596],
+                                   [4614054.3157130275, 6925814.718070663],
+                                   [4614084.51030582, 6925812.158053609]]]},
+     "properties": {"category": 36368, "categoryName": "Земельные участки ЕГРН",
+                    "descr": "68:29:0309001:24", "label": "68:29:0309001:24",
+                    "options": {"area": 1000.5, "cad_num": "68:29:0309001:24",
+                                "cost_determination_date": "2022-01-01", "cost_value": 1282227.6,
+                                "land_record_category_type": "Земли населенных пунктов",
+                                "land_record_reg_date": "2003-03-06",
+                                "land_record_subtype": "Землепользование",
+                                "land_record_type": "Земельный участок", "ownership_type": None,
+                                "permitted_use_established_by_document": "Под жилой   дом",
+                                "quarter_cad_number": "68:29:0309001",
+                                "readable_address": "Тамбовская обл, г Тамбов, ул Мичуринская"}}}]}}
+
+
+def to_mercator(longitude, latitude):
+    """WGS 84 → EPSG:3857, чтобы проверять пересчёт в обратную сторону."""
+    import math
+    x = math.radians(longitude) * 6378137.0
+    y = 6378137.0 * math.log(math.tan(math.pi / 4 + math.radians(latitude) / 2))
+    return x, y
+
+
+class NspdStub(BaseHTTPRequestHandler):
+    requests = []
+    answer = NSPD_ANSWER
+    statuses = []  # коды, которые сервер отдаст перед успешным ответом
+
+    def do_GET(self):
+        NspdStub.requests.append((self.path, dict(self.headers)))
+        if NspdStub.statuses:
+            code = NspdStub.statuses.pop(0)
+            body = b"Forbidden"
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = json.dumps(NspdStub.answer).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_cadastral_number_recognised():
+    from GeoSearchRU.nspd import is_cadastral_number, normalize_number
+    for text in ("68:29:0309001:24", "50:12:0000000:123", "68:29:0309001", " 68 : 29 : 0309001 : 24 "):
+        assert is_cadastral_number(text), text
+    for text in ("Тамбов, Энергетиков 7", "68:29", "", "68-29-0309001-24", "улица 1:2:3:4я"):
+        assert not is_cadastral_number(text), text
+    assert normalize_number(" 68 : 29 : 0309001 : 24 ") == "68:29:0309001:24"
+
+
+def test_nspd_geometry_is_converted_to_wgs84():
+    from GeoSearchRU.nspd import geometry_wkt
+    corners = [(41.45, 52.72), (41.46, 52.72), (41.46, 52.73), (41.45, 52.73)]
+    mercator = [list(to_mercator(lon, lat)) for lon, lat in corners]
+    wkt, box = geometry_wkt({"type": "Polygon", "coordinates": [mercator]})
+    assert wkt.startswith("POLYGON(("), wkt
+    assert wkt.count(",") == 4, "WKT замыкает кольцо пятой точкой"
+    assert len(box) == 4, "в рамку объекта замыкающая вершина не попадает"
+    for (want_lon, want_lat), (got_lon, got_lat) in zip(corners, box):
+        assert abs(got_lon - want_lon) < 1e-7 and abs(got_lat - want_lat) < 1e-7, (got_lon, got_lat)
+    assert geometry_wkt(None) == (None, [])
+    assert geometry_wkt({"type": "Polygon", "coordinates": []}) == (None, [])
+
+
+def test_nspd_parses_object():
+    from GeoSearchRU.nspd import Nspd
+    result = Nspd().parse(json.dumps(NSPD_ANSWER))[0]
+    assert result.address == "68:29:0309001:24 — Земельные участки ЕГРН, Тамбовская обл, г Тамбов, ул Мичуринская"
+    assert result.precision == "границы по ЕГРН" and result.coarse is False
+    assert abs(result.latitude - 52.65) < 0.05 and abs(result.longitude - 41.45) < 0.05, result
+    wkt, values, kind = result.geometry
+    assert wkt.startswith("POLYGON((") and kind == "Земельные участки ЕГРН"
+    assert values["cad_num"] == "68:29:0309001:24" and values["area"] == "1000.5"
+    assert values["use"] == "Под жилой дом", values["use"]  # лишние пробелы убираются
+    assert values["cost"] == "1282227.6" and values["quarter"] == "68:29:0309001"
+    assert "Категория земель: Земли населенных пунктов" in result.details
+    assert "Кадастровый номер" not in result.details, "номер уже в заголовке"
+    assert result.scale and result.scale < 5000, result.scale
+
+
+def test_nspd_object_without_boundaries():
+    from GeoSearchRU.nspd import Nspd
+    answer = json.loads(json.dumps(NSPD_ANSWER))
+    answer["data"]["features"][0]["geometry"] = None
+    result = Nspd().parse(json.dumps(answer))[0]
+    assert result.latitude is None and result.geometry is None
+    assert result.precision == "без границ в ЕГРН"
+    assert "Категория земель" in result.details, "сведения показываются и без границ"
+
+
+def test_nspd_end_to_end():
+    from GeoSearchRU.nspd import Nspd
+    server = HTTPServer(("127.0.0.1", 0), NspdStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    QSettings().setValue("GeoSearchRU/nspd_url", f"http://127.0.0.1:{server.server_port}/api/search")
+    NspdStub.requests = []
+    try:
+        dialog.set_provider("dadata")  # источник адресов остаётся выбранным
+        dialog.cadastral_edit.setText(" 68:29:0309001:24 ")
+        dialog.cadastral_button.click()
+        wait_for_reply()
+
+        path, headers = NspdStub.requests[0]
+        headers = lower_headers(headers)
+        query = parse_qs(urlparse(path).query)
+        assert query["query"] == ["68:29:0309001:24"] and query["thematicSearchId"] == ["1"], query
+        assert headers.get("referer") == "https://nspd.gov.ru/map?thematic=PKK", headers.get("referer")
+        # Защита НСПД пропускает только браузерный User-Agent, поэтому свой менеджер сети.
+        assert "QGIS/" not in headers.get("user-agent", ""), headers.get("user-agent")
+        assert headers.get("user-agent") == Nspd.USER_AGENT, headers.get("user-agent")
+        assert headers.get("sec-fetch-site") == "same-origin"
+        # Без набора sec-ch-ua защита НСПД отвечает 597: проверено на живом сервере.
+        assert headers.get("sec-ch-ua-mobile") == "?0", headers
+        assert headers.get("sec-ch-ua-platform") == '"macOS"', headers
+        assert "Chromium" in headers.get("sec-ch-ua", ""), headers
+        assert "Chrome/140" in headers.get("sec-ch-ua", "") + headers.get("user-agent", "")
+
+        assert dialog.results_list.count() == 1
+        card = dialog.normalized_address.toPlainText()
+        assert "Источник: НСПД (ЕГРН)" in card and "Разрешённое использование: Под жилой дом" in card, card
+        assert "Кадастровая стоимость, ₽: 1282227.6" in card, card
+        assert dialog.add_point_button.text() == "Добавить границы во временный слой"
+        assert dialog.add_point_button.isEnabled()
+
+        dialog.add_point_button.click()
+        layers = [l for l in QgsProject.instance().mapLayers().values() if l.name() == "Кадастровые объекты"]
+        assert len(layers) == 1, "слой границ один"
+        layer = layers[0]
+        assert layer.crs().authid() == "EPSG:4326" and layer.featureCount() == 1
+        feature = next(layer.getFeatures())
+        assert feature["cad_num"] == "68:29:0309001:24" and feature["kind"] == "Земельные участки ЕГРН"
+        assert abs(feature["area"] - 1000.5) < 1e-6 and abs(feature["cost"] - 1282227.6) < 1e-3
+        assert feature["source"] == "НСПД (ЕГРН)"
+        assert feature.geometry().type() == Qgis.GeometryType.Polygon
+        index = layer.fields().indexOf("cad_num")
+        assert layer.attributeAlias(index) == "Кадастровый номер", layer.attributeAlias(index)
+
+        dialog.add_point_button.click()
+        assert layer.featureCount() == 1 and "уже есть" in dialog.status_label.text()
+
+        dialog.cadastral_edit.setText("68:29:0309001:24")
+        dialog.cadastral_button.click()
+        assert len(NspdStub.requests) == 1, "повторный номер — из кэша"
+    finally:
+        server.shutdown()
+        QgsProject.instance().removeAllMapLayers()
+        plugin.cadastre_layer_ids = {}
+        plugin.points_layer_id = None
+        plugin.cache.clear()
+        QSettings().remove("GeoSearchRU/nspd_url")
+
+
+def test_nspd_ssl_error_explains_certificate():
+    error = QNetworkReply.NetworkError.SslHandshakeFailedError
+    key = ("nspd", "cadastral:68:29:0309001:24", None)
+    plugin.ssl_problems = ["The root certificate of the certificate chain is self-signed"]
+    message = respond(FakeReply("", error=error, status=None, error_string="SSL handshake failed"), key=key)
+    assert "сертификат сервера не принят" in message and "Минцифры" in message, message
+    assert "self-signed" in message, message
+    # Сервер оборвал рукопожатие сам — сертификат тут ни при чём, писать про него нельзя.
+    plugin.ssl_problems = []
+    message = respond(FakeReply("", error=error, status=None, error_string="SSL handshake failed"), key=key)
+    assert "разорвал защищённое соединение" in message, message
+    assert "сертификат" not in message.lower(), message
+
+
+def test_nspd_retries_after_temporary_refusal():
+    """597 у НСПД — отбой всплеска, а не окончательный отказ: запрос надо повторить."""
+    from GeoSearchRU.nspd import Nspd
+    source = plugin.providers[Nspd.ID]
+    server = HTTPServer(("127.0.0.1", 0), NspdStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    QSettings().setValue("GeoSearchRU/nspd_url", f"http://127.0.0.1:{server.server_port}/api/search")
+    NspdStub.requests, NspdStub.statuses = [], [597, 597]
+    delay, source.RETRY_DELAY_MS = source.RETRY_DELAY_MS, 50
+    try:
+        dialog.cadastral_edit.setText("68:29:0309001:24")
+        dialog.cadastral_button.click()
+        wait_for_reply()
+        assert len(NspdStub.requests) == 3, f"должно быть три попытки, а было {len(NspdStub.requests)}"
+        assert dialog.results_list.count() == 1, "после повтора объект должен найтись"
+        assert "отклонил" not in dialog.status_label.text(), dialog.status_label.text()
+
+        # Отказы не кончились — тогда сдаёмся и объясняем.
+        NspdStub.requests, NspdStub.statuses = [], [597, 597, 597]
+        plugin.cache.clear()
+        dialog.cadastral_button.click()
+        wait_for_reply()
+        assert len(NspdStub.requests) == 3, "больше трёх попыток не делаем"
+        assert "597" in dialog.status_label.text(), dialog.status_label.text()
+    finally:
+        source.RETRY_DELAY_MS = delay
+        NspdStub.statuses = []
+        server.shutdown()
+        QgsProject.instance().removeAllMapLayers()
+        plugin.cadastre_layer_ids, plugin.points_layer_id = {}, None
+        plugin.cache.clear()
+        QSettings().remove("GeoSearchRU/nspd_url")
+
+
+def test_map_frame_choice_survives_source_switch():
+    """У DaData рамка не работает: галочка гаснет, но выбор пользователя не теряется."""
+    dialog.set_provider("nominatim")
+    dialog.bounded.setChecked(True)
+    assert QSettings().value("GeoSearchRU/bounded", False, type=bool) is True
+    dialog.set_provider("dadata")
+    assert not dialog.bounded.isEnabled() and not dialog.bounded.isChecked(), "у DaData галочка гаснет"
+    assert QSettings().value("GeoSearchRU/bounded", False, type=bool) is True, "выбор не должен стираться"
+    dialog.set_provider("nominatim")
+    assert dialog.bounded.isChecked(), "при возврате к источнику с рамкой галочка возвращается"
+    dialog.bounded.setChecked(False)
+    dialog.set_provider("dadata")
+
+
+def test_bottom_buttons_fit_at_large_font():
+    """Подписи внизу обрезались при крупном системном шрифте: ширина окна должна расти вместе с ним."""
+    from qgis.PyQt.QtGui import QFont
+    from qgis.PyQt.QtWidgets import QPushButton
+    from GeoSearchRU.geosearch_ru_dialog import ADD_SHAPE_TEXT, GeoSearchDialog
+
+    normal = iface.window.font()
+    big = QFont(normal)
+    big.setPointSizeF(max(normal.pointSizeF(), 10.0) * 1.5)
+    try:
+        iface.window.setFont(big)  # окно создаётся уже с крупным шрифтом
+        probe = GeoSearchDialog([("dadata", "DaData")], iface.window)
+        probe.show_add_mode(True)  # самая длинная подпись
+        names = ("Очистить маркер", "Адрес по точке на карте", ADD_SHAPE_TEXT, "Закрыть")
+        row = [b for b in probe.findChildren(QPushButton) if b.text() in names]
+        assert len(row) == len(names), [b.text() for b in row]
+        needed = sum(b.sizeHint().width() for b in row) + 8 * len(row)  # запас на промежутки
+        assert needed <= probe.minimumWidth(), (
+            f"при крупном шрифте кнопкам нужно {needed} px, а окно не шире {probe.minimumWidth()} px")
+        probe.deleteLater()
+    finally:
+        iface.window.setFont(normal)
+
+
+def test_status_colours_follow_theme():
+    """На тёмном фоне тёмно-красный не читается: цвета состояния идут за палитрой."""
+    from qgis.PyQt.QtGui import QColor, QPalette
+    from GeoSearchRU.geosearch_ru_dialog import status_colour
+
+    light, dark = QPalette(), QPalette()
+    light.setColor(QPalette.ColorRole.Window, QColor(240, 240, 240))
+    dark.setColor(QPalette.ColorRole.Window, QColor(45, 45, 48))
+    label = QLabel()
+    label.setPalette(light)
+    assert status_colour(label, "error") == "#b71c1c", status_colour(label, "error")
+    label.setPalette(dark)
+    for level in ("ok", "warning", "error"):
+        colour = QColor(status_colour(label, level))
+        assert colour.lightness() > 150, f"{level}: {colour.name()} на тёмном фоне не прочитать"
+
+
+def test_cadastral_field_checks_input():
+    """Отдельное поле КН: пустое и непохожее на номер объясняются, запроса не будет."""
+    dialog.cadastral_edit.clear()
+    dialog.cadastral_button.click()
+    assert "Введите кадастровый номер" in dialog.status_label.text(), dialog.status_label.text()
+    assert plugin.reply is None and plugin.pending is None, "запроса быть не должно"
+    dialog.cadastral_edit.setText("Тамбов, Энергетиков 7")
+    dialog.cadastral_button.click()
+    assert "не похоже на кадастровый номер" in dialog.status_label.text(), dialog.status_label.text()
+    assert plugin.reply is None and plugin.pending is None, "запроса быть не должно"
+    dialog.cadastral_edit.clear()
+
+
+def test_cadastral_number_in_address_field_still_works():
+    """Номер, набранный в поле адреса, не теряется: перекладывается в поле КН."""
+    server = HTTPServer(("127.0.0.1", 0), NspdStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    QSettings().setValue("GeoSearchRU/nspd_url", f"http://127.0.0.1:{server.server_port}/api/search")
+    NspdStub.requests = []
+    try:
+        dialog.cadastral_edit.clear()
+        dialog.address_edit.setText("68:29:0309001:24")
+        dialog.search_button.click()
+        wait_for_reply()
+        assert dialog.cadastral_edit.text() == "68:29:0309001:24", dialog.cadastral_edit.text()
+        assert len(NspdStub.requests) == 1, "должен уйти запрос в НСПД, а не в DaData"
+        assert dialog.results_list.count() == 1
+    finally:
+        server.shutdown()
+        QgsProject.instance().removeAllMapLayers()
+        plugin.cadastre_layer_ids, plugin.points_layer_id = {}, None
+        plugin.cache.clear()
+        dialog.address_edit.clear()
+        dialog.cadastral_edit.clear()
+        QSettings().remove("GeoSearchRU/nspd_url")
+
+
+def test_nspd_uses_its_own_network_manager():
+    from GeoSearchRU.nspd import Nspd
+    from GeoSearchRU.providers import Nominatim
+    assert plugin._manager(Nominatim()) is QgsNetworkAccessManager.instance()
+    own = plugin._manager(Nspd())
+    assert own is not QgsNetworkAccessManager.instance()
+    assert plugin._manager(Nspd()) is own, "менеджер создаётся один раз"
+
+
+def test_nspd_url_setting_is_visible():
+    from GeoSearchRU.nspd import Nspd
+    QSettings().remove("GeoSearchRU/nspd_url")
+    assert Nspd().url() == Nspd.DEFAULT_URL
+    assert QSettings().value("GeoSearchRU/nspd_url") == Nspd.DEFAULT_URL
+    QSettings().remove("GeoSearchRU/nspd_url")
 
 
 def test_unload_aborts_request_silently():

@@ -16,14 +16,15 @@ C="$APP/Contents"
 # Старая сборка: свой python в MacOS/bin и пакеты в Resources/python.
 # Сборка 3.44 и новее: python рядом с QGIS, пакеты в Resources/python<версия>/site-packages,
 # стандартная библиотека — в Frameworks, её путь надо задать через PYTHONHOME.
+# Префикс QGIS у новых сборок — само приложение: иначе не найдутся провайдеры (CSV, облака точек, WMS…).
 PY="$C/MacOS/bin/python3"
+export QGIS_PREFIX_PATH="$C/MacOS"
 if [ ! -x "$PY" ]; then
   PY=$(ls "$C/MacOS"/python3.* 2>/dev/null | head -1)
-  export PYTHONHOME="$C/Frameworks"
+  export PYTHONHOME="$C/Frameworks" QGIS_PREFIX_PATH="$APP"
 fi
 [ -x "$PY" ] || { echo "в $APP нет python"; exit 1; }
 SITE=$(ls -d "$C/Resources"/python*/site-packages 2>/dev/null | head -1)
-export QGIS_PREFIX_PATH="$C/MacOS"
 export PYTHONPATH="${SITE:-$C/Resources/python}${PYTHONPATH:+:$PYTHONPATH}"
 # proj.db переехал: Resources/proj в старых сборках, Resources/qgis/proj в 3.44 и новее.
 # Без него пересчёт координат молча возвращает исходную точку.

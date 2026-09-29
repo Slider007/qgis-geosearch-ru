@@ -22,8 +22,10 @@ PLUGIN_URL = "https://github.com/Slider007/qgis-geosearch-ru"
 
 # precision: text for the user; coarse: coordinates are not at house level; scale: map scale to zoom to;
 # parts: the address split into fields (see PART_FIELDS), as far as the service reports them;
-# details: extra lines about the object, shown in the card under the list («Что здесь?»).
-Result = namedtuple("Result", "address latitude longitude precision coarse scale parts details")
+# details: extra lines about the object, shown in the card under the list («Что здесь?»);
+# geometry: (WKT в WGS 84, {поле: значение}, вид объекта) у источников, которые отдают границы (НСПД).
+Result = namedtuple("Result", "address latitude longitude precision coarse scale parts details geometry",
+                    defaults=(None,))
 
 NO_COORDINATES = "без координат"
 
