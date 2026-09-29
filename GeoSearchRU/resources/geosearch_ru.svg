@@ -1,1 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="28" cy="28" r="18" fill="#2e7d32"/><circle cx="28" cy="28" r="10" fill="none" stroke="white" stroke-width="4"/><path d="M41 41l13 13" stroke="white" stroke-width="6" stroke-linecap="round"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!-- Лупа с меткой адреса внутри: одна плотная фигура, поэтому читается и в 16 пикселях.
+       Две отдельные фигуры (метка рядом с лупой) в этом размере сливались в пятно. -->
+  <path d="M22.5 22.5 L29.5 29.5" fill="none" stroke="#23497d" stroke-width="4.4" stroke-linecap="round"/>
+  <circle cx="14" cy="14" r="11.5" fill="#dcebf7" stroke="#23497d" stroke-width="2.4"/>
+  <path d="M14 21.5 C14 21.5 9 15.5 9 11.8 A5 5 0 1 1 19 11.8 C19 15.5 14 21.5 14 21.5 Z"
+        fill="#e05a4a" stroke="#9e2b1d" stroke-width="1.1" stroke-linejoin="round"/>
+  <circle cx="14" cy="11.7" r="2" fill="#ffffff"/>
+</svg>
