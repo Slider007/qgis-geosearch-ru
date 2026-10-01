@@ -13,12 +13,11 @@
 import json
 import math
 import re
-from urllib.parse import quote
 
-from qgis.PyQt.QtCore import QSettings, QUrl
+from qgis.PyQt.QtCore import QSettings, QUrl, QUrlQuery
 from qgis.PyQt.QtNetwork import QNetworkRequest
 
-from .providers import NO_COORDINATES, Result, _json_message
+from .providers import Result, _json_message
 
 # Кадастровый номер: квартал (три части) или объект (четыре).
 # Пример: 68:29:0309001 и 68:29:0309001:24. Нули в номере квартала бывают (50:12:0000000:123).
@@ -164,7 +163,7 @@ class Nspd:
         'границы и площадь могут быть уточнены, а участки без координат на карте не показываются.'
     )
     MIN_INTERVAL_MS = 1500  # НСПД перестаёт отвечать, если частить
-    TIMEOUT_MS = 30000
+    TIMEOUT_MS = 15000  # с тремя попытками ожидание и так до минуты, см. MAX_ATTEMPTS
     DEFAULT_URL = "https://nspd.gov.ru/api/geoportal/v2/search/geoportal"
     SETTINGS_URL = "GeoSearchRU/nspd_url"
     THEMATIC_SEARCH_ID = 1  # поиск по ЕГРН
@@ -200,8 +199,13 @@ class Nspd:
 
     def request(self, query, token="", count=10, secret="", signature_mode=None, bbox=None):
         number = normalize_number(query)
-        address = f"{self.url()}?query={quote(number)}&thematicSearchId={self.THEMATIC_SEARCH_ID}"
-        request = QNetworkRequest(QUrl(address))
+        # Через QUrlQuery, а не склейкой: свой адрес сервера может уже содержать «?».
+        url = QUrl(self.url())
+        parameters = QUrlQuery(url.query())
+        parameters.addQueryItem("query", number)
+        parameters.addQueryItem("thematicSearchId", str(self.THEMATIC_SEARCH_ID))
+        url.setQuery(parameters)
+        request = QNetworkRequest(url)
         for name, value in (
             # User-Agent задаётся здесь: запрос идёт мимо QgsNetworkAccessManager (OWN_NETWORK),
             # а Qt по умолчанию присылает короткий «Mozilla/5.0», которого защите НСПД мало.
@@ -278,4 +282,4 @@ class Nspd:
 
 
 __all__ = ["Nspd", "is_cadastral_number", "normalize_number", "geometry_wkt",
-           "FIELD_NAMES", "FIELD_LABELS", "NUMERIC_FIELDS", "NO_COORDINATES"]
+           "FIELD_NAMES", "FIELD_LABELS", "NUMERIC_FIELDS"]

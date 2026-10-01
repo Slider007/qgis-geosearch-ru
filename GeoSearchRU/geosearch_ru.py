@@ -2,7 +2,8 @@ import os
 
 from qgis.core import (
     Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsFeature, QgsFillSymbol,
-    QgsGeometry, QgsMarkerSymbol, QgsNetworkAccessManager, QgsPointXY, QgsProject, QgsVectorLayer,
+    QgsGeometry, QgsMarkerSymbol, QgsMessageLog, QgsNetworkAccessManager, QgsPointXY, QgsProject,
+    QgsVectorLayer,
 )
 from qgis.gui import QgsMapToolEmitPoint, QgsVertexMarker
 from qgis.PyQt.QtCore import QElapsedTimer, QSettings, QTimer
@@ -130,6 +131,7 @@ class GeoSearchRU:
             self.dialog.keys_button.clicked.connect(lambda: self.open_keys(self.provider().ID))
             self.dialog.search_button.clicked.connect(self.search)
             self.dialog.cadastral_button.clicked.connect(self.search_cadastral)
+            self.dialog.stop_button.clicked.connect(self.stop_request)
             self.dialog.results_list.currentRowChanged.connect(self.show_result)
             self.dialog.clear_button.clicked.connect(self.clear_result)
             self.dialog.add_point_button.clicked.connect(self.add_point)
@@ -263,6 +265,16 @@ class GeoSearchRU:
         self.throttle.start(getattr(provider, "RETRY_DELAY_MS", 3000))
         return True
 
+    def stop_request(self):
+        """Прервать запрос по кнопке «Остановить»: у НСПД с повторами ожидание долгое."""
+        self.throttle.stop()
+        self.pending = None
+        self.current = None
+        self._abort_request()
+        self.reply_key = None
+        self.dialog.set_busy(False)
+        self.dialog.set_status("Поиск остановлен.", "warning")
+
     def _ssl_errors(self, errors):
         self.ssl_problems = [error.errorString() for error in errors]
 
@@ -302,7 +314,9 @@ class GeoSearchRU:
         try:
             results = provider.parse(body)
         except (KeyError, TypeError, ValueError, AttributeError):
-            self.dialog.set_status(f"Не удалось разобрать ответ {provider.SOURCE}.", "error")
+            self.dialog.set_status(
+                f"Не удалось разобрать ответ {provider.SOURCE}: похоже, служба изменила формат. "
+                "Повторите позже или выберите другой источник.", "error")
             return
         self.cache[key] = results
         self._show_results(provider, results, key)
@@ -348,7 +362,9 @@ class GeoSearchRU:
                 if provider.ID == Nspd.ID else "У этого варианта нет координат.", "error")
             return
         if not self.center_and_mark(result.longitude, result.latitude, result.scale, recenter=not keep_view):
-            self.dialog.set_status("Не удалось пересчитать координаты в систему координат проекта.", "error")
+            self.dialog.set_status(
+                "Не удалось пересчитать координаты в систему координат проекта. "
+                "Проверьте СК проекта в правом нижнем углу окна QGIS.", "error")
         elif provider.ID == Nspd.ID:
             self.dialog.set_status("Объект ЕГРН найден, границы показаны на карте.")
         elif not provider.COARSE_WARNING:
@@ -407,7 +423,9 @@ class GeoSearchRU:
         wkt, values, kind = result.geometry
         geometry = QgsGeometry.fromWkt(wkt)  # WKT уже в WGS 84, как и слой
         if geometry.isNull() or geometry.isEmpty():
-            self.dialog.set_status("Границы объекта не удалось прочитать.", "error")
+            self.dialog.set_status(
+                "Границы объекта не удалось прочитать: в ответе ЕГРН неожиданная геометрия. "
+                "Сведения об объекте остаются в карточке.", "error")
             return
         layer = self._cadastre_layer(geometry.type())
         number = values.get("cad_num", "")
@@ -525,7 +543,9 @@ class GeoSearchRU:
     def _point_picked(self, point, _button=None):
         wgs84 = self._to_wgs84(point)
         if wgs84 is None:
-            self.dialog.set_status("Не удалось пересчитать точку в WGS 84.", "error")
+            self.dialog.set_status(
+                "Не удалось пересчитать точку карты в WGS 84. "
+                "Проверьте СК проекта в правом нижнем углу окна QGIS.", "error")
             return
         info = self.click_mode == "info"
         provider = self.providers[Overpass.ID] if info else self.provider()
@@ -695,7 +715,14 @@ class GeoSearchRU:
                 hint = getattr(provider, "TIMEOUT_HINT", None) or (
                     "Проверьте подключение к интернету и настройки прокси в QGIS.")
                 return f"{provider.SOURCE} не ответил вовремя. {hint}"
-            return f"Сетевая ошибка: {reply.errorString()}"
-        message = f"{provider.SOURCE} вернул ошибку {status}: {provider.HTTP_HINTS.get(int(status), reply.errorString())}"
+            # errorString() у Qt по-английски: в русское окно его не выносим, он уходит в журнал.
+            QgsMessageLog.logMessage(f"{provider.SOURCE}: {reply.errorString()}", "Поиск адреса", Qgis.Warning)
+            return (f"{provider.SOURCE} недоступен. Проверьте подключение к интернету "
+                    "и настройки прокси в QGIS; подробности — в журнале сообщений QGIS.")
+        hint = provider.HTTP_HINTS.get(int(status))
+        if hint is None:
+            QgsMessageLog.logMessage(f"{provider.SOURCE} {status}: {reply.errorString()}", "Поиск адреса", Qgis.Warning)
+            hint = "служба не приняла запрос, подробности — в журнале сообщений QGIS"
+        message = f"{provider.SOURCE} вернул ошибку {status}: {hint}"
         detail = provider.error_detail(body)
         return f"{message} ({detail})" if detail else message

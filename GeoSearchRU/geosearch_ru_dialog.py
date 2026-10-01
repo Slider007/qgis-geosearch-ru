@@ -73,6 +73,10 @@ class GeoSearchDialog(QDialog):
         self.results_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.normalized_address = QTextBrowser()
         self.normalized_address.setMinimumHeight(line * 7 + 20)  # address, blank, header and four value lines
+        self.stop_button = QPushButton("Остановить")
+        self.stop_button.setAutoDefault(False)
+        self.stop_button.setToolTip("Прервать запрос, не дожидаясь ответа службы")
+        self.stop_button.setVisible(False)  # видна только во время запроса
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.status_label.setMinimumHeight(line * 3 + 4)  # длинные объяснения ошибок занимают три строки
@@ -111,7 +115,10 @@ class GeoSearchDialog(QDialog):
         layout.addWidget(self.results_list)
         layout.addWidget(QLabel("Сведения о выбранном объекте:"))
         layout.addWidget(self.normalized_address)
-        layout.addWidget(self.status_label)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.stop_button, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(status_row)
         layout.addWidget(self.attribution_label)
         layout.addWidget(buttons)
         # Скрывать до addButton бесполезно: QDialogButtonBox показывает добавленную кнопку заново.
@@ -179,14 +186,15 @@ class GeoSearchDialog(QDialog):
         self.results_list.clear()
         self.add_point_button.setEnabled(False)
         self.show_add_mode(False)
-        self.results_label.setText("Варианты:")
+        self.results_label.setText("Варианты: здесь появятся найденные адреса и объекты")
         self.normalized_address.clear()
 
     def set_busy(self, busy):
         for widget in (self.search_button, self.address_edit, self.provider_combo, self.keys_button,
                        self.cadastral_edit, self.cadastral_button, self.pick_button, self.info_button):
             widget.setEnabled(not busy)
-        self.status_label.setText("Идет поиск…" if busy else "")
+        self.stop_button.setVisible(busy)
+        self.status_label.setText("Идёт поиск…" if busy else "")
 
     def set_status(self, message, level="ok"):
         colour = status_colour(self, level)

@@ -1064,6 +1064,68 @@ def test_bottom_buttons_fit_at_large_font():
         iface.window.setFont(normal)
 
 
+def test_stop_button_cancels_request():
+    """Запрос к НСПД с тремя попытками длится до минуты: должна быть кнопка выхода."""
+    assert not dialog.stop_button.isVisibleTo(dialog), "в покое кнопки «Остановить» не видно"
+    reply = FakeReply("{}")
+    reply.finished.connect(plugin.handle_response)
+    plugin.reply, plugin.reply_key = reply, ("nspd", "cadastral:68:29:0309001:24", None)
+    plugin.current = (plugin.providers["nspd"], plugin.reply_key, lambda t, s: (None, None))
+    dialog.set_busy(True)
+    assert dialog.stop_button.isVisibleTo(dialog), "во время запроса кнопка видна"
+    dialog.stop_button.click()
+    assert reply.aborted and reply.finished.slots == [], "ответ оборван, обработчик отключён"
+    assert plugin.reply is None and plugin.pending is None and plugin.current is None
+    assert "остановлен" in dialog.status_label.text(), dialog.status_label.text()
+    assert not dialog.stop_button.isVisibleTo(dialog), "после остановки кнопка прячется"
+    assert dialog.search_button.isEnabled(), "поля снова доступны"
+
+
+def test_network_error_is_russian():
+    """errorString() у Qt по-английски — в русское окно он попадать не должен."""
+    message = respond(FakeReply("", error=QNetworkReply.NetworkError.HostNotFoundError, status=None,
+                                error_string="Host nspd.gov.ru not found"),
+                      key=("nspd", "cadastral:68:29:0309001:24", None))
+    assert "Host" not in message and "not found" not in message, message
+    assert "недоступен" in message and "журнале сообщений QGIS" in message, message
+    # Незнакомый код HTTP тоже не должен тащить английский текст в окно.
+    message = respond(FakeReply("", error=QNetworkReply.NetworkError.UnknownContentError, status=418,
+                                error_string="I am a teapot"),
+                      key=("nspd", "cadastral:68:29:0309001:24", None))
+    assert "teapot" not in message, message
+    assert "418" in message, message
+
+
+def test_failure_messages_say_what_to_do():
+    """Сообщение об ошибке без выхода оставляет человека в тупике."""
+    message = respond(FakeReply("не json"), key=("nspd", "cadastral:68:29:0309001:24", None))
+    assert "Повторите позже" in message or "другой источник" in message, message
+
+
+def test_nspd_url_with_parameters():
+    """Свой адрес сервера может уже содержать «?» — склейка строк ломала запрос."""
+    from GeoSearchRU.nspd import Nspd
+    QSettings().setValue("GeoSearchRU/nspd_url", "https://nspd.example.ru/api/search?token=abc")
+    try:
+        request, _body = Nspd().request("68:29:0309001:24")
+        url = request.url()
+        assert url.toString().count("?") == 1, url.toString()
+        query = parse_qs(urlparse(url.toString()).query)
+        assert query["token"] == ["abc"], query
+        assert query["query"] == ["68:29:0309001:24"] and query["thematicSearchId"] == ["1"], query
+    finally:
+        QSettings().remove("GeoSearchRU/nspd_url")
+
+
+def test_busy_and_empty_texts():
+    """Мелочи, которые видит человек: «ё» в слове «идёт» и пояснение у пустого списка."""
+    dialog.set_busy(True)
+    assert "Идёт поиск" in dialog.status_label.text(), dialog.status_label.text()
+    dialog.set_busy(False)
+    dialog.clear_results()
+    assert "здесь появятся" in dialog.results_label.text(), dialog.results_label.text()
+
+
 def test_status_colours_follow_theme():
     """На тёмном фоне тёмно-красный не читается: цвета состояния идут за палитрой."""
     from qgis.PyQt.QtGui import QColor, QPalette
