@@ -80,6 +80,9 @@ class GeoSearchRU:
     def initGui(self):
         icon = QIcon(os.path.join(os.path.dirname(__file__), "resources", "geosearch_ru.svg"))
         self.action = QAction(icon, "Поиск адреса…", self.iface.mainWindow())
+        # подсказка говорила только «Поиск адреса» — повтор названия кнопки
+        self.action.setToolTip("Найти адрес или кадастровый номер и показать место на карте; "
+                               "адрес по точке на карте")
         self.action.triggered.connect(self.show_dialog)
         altan_toolbar.add_action(self.iface, self.action)
         altan_toolbar.add_to_menu(self.iface, self.action)

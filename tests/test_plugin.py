@@ -146,6 +146,12 @@ def test_menu():
     assert iface.menu == ["&Альтан-Эко"], iface.menu
 
 
+def test_button_tooltip_explains():
+    """Подсказка кнопки объясняет, что она делает, а не повторяет название."""
+    tip = plugin.action.toolTip()
+    assert tip != plugin.action.text().rstrip("…") and "кадастров" in tip, tip
+
+
 def test_shared_toolbar():
     bar = iface.window.findChild(QToolBar, "AltanEcoToolbar")
     assert bar is not None and bar.windowTitle() == "Альтан-Эко"
